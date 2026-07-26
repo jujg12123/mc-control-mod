@@ -1,0 +1,10 @@
+.gradle/
+build/
+*.class
+*.jar
+*.log
+*.iml
+.idea/
+.vscode/
+*.zip
+*.tar.gz

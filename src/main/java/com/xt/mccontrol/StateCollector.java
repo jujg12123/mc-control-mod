@@ -47,18 +47,8 @@ public class StateCollector {
             state.addProperty("looking_at_pos", "");
         }
 
-        // 周围实体（10 格内）— 1.20.1 API 适配
+        // 周围实体 — 暂时禁用（1.20.1 API 兼容性）
         JsonArray entities = new JsonArray();
-        for (net.minecraft.entity.Entity entity : player.getWorld().iterateEntities()) {
-            double dist = entity.distanceTo(player);
-            if (dist < 10 && entity != player) {
-                JsonObject e = new JsonObject();
-                e.addProperty("name", entity.getName().getString());
-                e.addProperty("type", entity.getType().getName().getString());
-                e.addProperty("distance", round(dist));
-                entities.add(e);
-            }
-        }
         state.add("nearby_entities", entities);
 
         // 背包（0-35）

@@ -1,0 +1,8 @@
+{
+  "name": "mc-control",
+  "displayName": "Minecraft 控制",
+  "version": "1.0.0",
+  "author": "主人",
+  "description": "让 AI 操控 Minecraft 客户端，通过 WebSocket 连接 Fabric Mod",
+  "main": "index.js"
+}

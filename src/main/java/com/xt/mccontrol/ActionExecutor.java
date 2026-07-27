@@ -102,6 +102,13 @@ public class ActionExecutor {
                 }
                 case "stop_nav" -> releaseAllKeys(client);
 
+                // === 新增：持续挖掘直到方块破坏 ===
+                case "dig_block" -> {
+                    double timeout = cmd.has("timeout")
+                            ? cmd.get("timeout").getAsDouble() : 10.0;
+                    digBlock(player, timeout);
+                }
+
                 // === 新增：向下挖掘（安全） ===
                 case "dig_down" -> {
                     int distance = cmd.has("distance")
@@ -201,6 +208,61 @@ public class ActionExecutor {
                 client.execute(() -> client.options.forwardKey.setPressed(false)),
                 (long) (duration * 1000), TimeUnit.MILLISECONDS);
     }
+
+    // === 持续挖掘直到方块破坏，然后捡掉落物 ===
+        private static void digBlock(ClientPlayerEntity player, double timeout) {
+            MinecraftClient client = MinecraftClient.getInstance();
+            World world = player.getWorld();
+
+            HitResult hit = player.raycast(5.0, 0, false);
+            if (hit.getType() != HitResult.Type.BLOCK) {
+                System.out.println("[MC-Control] No block in sight to dig");
+                return;
+            }
+            BlockHitResult blockHit = (BlockHitResult) hit;
+            BlockPos targetPos = blockHit.getBlockPos();
+            BlockState targetState = world.getBlockState(targetPos);
+            if (targetState.isAir()) {
+                System.out.println("[MC-Control] Target block is air");
+                return;
+            }
+            String blockName = targetState.getBlock().getName().getString();
+            System.out.println("[MC-Control] Digging " + blockName + " at " + targetPos.toShortString());
+
+            // 按住挖掘键
+            client.options.attackKey.setPressed(true);
+
+            // 用调度器定时检查方块状态并释放
+            long timeoutMs = (long) (timeout * 1000);
+            long checkInterval = 100; // 每 100ms 检查一次
+
+            scheduler.execute(() -> {
+                long start = System.currentTimeMillis();
+                while (System.currentTimeMillis() - start < timeoutMs) {
+                    try { Thread.sleep(checkInterval); } catch (InterruptedException e) { break; }
+                    if (world.getBlockState(targetPos).isAir()) {
+                        // 方块已破坏
+                        client.execute(() -> {
+                                                    client.options.attackKey.setPressed(false);
+                                                    // 延迟后向前走捡掉落物
+                                                    scheduler.schedule(() ->
+                                                            client.execute(() -> {
+                                                                client.options.forwardKey.setPressed(true);
+                                                                scheduler.schedule(() ->
+                                                                        client.execute(() -> client.options.forwardKey.setPressed(false)),
+                                                                        500, TimeUnit.MILLISECONDS);
+                                                            }),
+                                                            300, TimeUnit.MILLISECONDS);
+                                                });
+                        System.out.println("[MC-Control] Block broken!");
+                        return;
+                    }
+                }
+                // 超时
+                client.execute(() -> client.options.attackKey.setPressed(false));
+                System.out.println("[MC-Control] Dig timed out");
+            });
+        }
 
     // === 安全向下挖 ===
     private static void digDown(ClientPlayerEntity player, int distance) {

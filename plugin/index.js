@@ -228,6 +228,20 @@ class MCControlPlugin extends Plugin {
             {
                 type: 'function',
                 function: {
+                    name: 'mc_digBlock',
+                    description: '持续挖掘视线前方的方块直到破坏，自动捡掉落物。比 mc_dig 更智能，会等到方块真正破坏',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            timeout: { type: 'number', description: '超时时间（秒），默认 10', default: 10 }
+                        },
+                        required: []
+                    }
+                }
+            },
+            {
+                type: 'function',
+                function: {
                     name: 'mc_digDown',
                     description: '安全向下挖掘，会自动检测岩浆和水',
                     parameters: {
@@ -376,6 +390,11 @@ class MCControlPlugin extends Plugin {
                 return '✅ 任务完成: ' + (done || '未知');
             }
             // === 更多动作 ===
+            case 'mc_digBlock': {
+                const { timeout = 10 } = params || {};
+                this.mc.sendAction({ action: 'dig_block', timeout });
+                return '✅ 持续挖掘，超时 ' + timeout + ' 秒...';
+            }
             case 'mc_digDown': {
                 const { distance = 1 } = params || {};
                 this.mc.sendAction({ action: 'dig_down', distance });

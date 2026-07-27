@@ -171,10 +171,10 @@ public class ActionExecutor {
                             if (idStr.toLowerCase().contains(blockType.toLowerCase()) ||
                                                             name.toLowerCase().contains(blockType.toLowerCase())) {
                                                             // 加权距离：垂直差 3 倍权重，优先找同高度或下方的方块
-                                                            double dx = pos.getX() - playerPos.getX();
-                                                            double dy = pos.getY() - playerPos.getY();
-                                                            double dz = pos.getZ() - playerPos.getZ();
-                                                            double weightedDist = dx*dx + dz*dz + (dy*dy) * 9.0;
+                                                                                                                        double hx = pos.getX() - playerPos.getX();
+                                                                                                                        double hy = pos.getY() - playerPos.getY();
+                                                                                                                        double hz = pos.getZ() - playerPos.getZ();
+                                                                                                                        double weightedDist = hx*hx + hz*hz + (hy*hy) * 9.0;
                                                             if (weightedDist < nearestDist && weightedDist > 0.25) {
                                                                 nearestDist = weightedDist;
                                                                 nearest = pos;

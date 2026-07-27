@@ -189,25 +189,128 @@ public class ActionExecutor {
     }
 
     private static void goToPos(ClientPlayerEntity player, double tx, double ty, double tz) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        double px = player.getX();
-        double py = player.getY() + 0.5;
-        double pz = player.getZ();
-        double dx = tx - px;
-        double dy = ty - py;
-        double dz = tz - pz;
-        double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        double yaw = Math.toDegrees(Math.atan2(-dx, dz));
-        double pitch = Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
-        player.setYaw((float) yaw);
-        player.setPitch((float) pitch);
-        double duration = Math.min(dist * 0.15, 3.0);
-        if (duration < 0.3) duration = 0.3;
-        client.options.forwardKey.setPressed(true);
-        scheduler.schedule(() ->
-                client.execute(() -> client.options.forwardKey.setPressed(false)),
-                (long) (duration * 1000), TimeUnit.MILLISECONDS);
-    }
+            MinecraftClient client = MinecraftClient.getInstance();
+            World world = player.getWorld();
+
+            // 在后台线程中循环追踪目标
+            scheduler.execute(() -> {
+                double lastX = player.getX();
+                double lastZ = player.getZ();
+                int stuckTicks = 0;
+                int totalTicks = 0;
+                int maxTicks = 600; // 30 秒超时
+                boolean jumping = false;
+                int strafeDir = 0; // 0=直走, 1=左偏, -1=右偏
+
+                while (totalTicks < maxTicks) {
+                    try { Thread.sleep(100); } catch (InterruptedException e) { break; }
+                    totalTicks++;
+
+                    double px = player.getX();
+                    double py = player.getY() + 0.5;
+                    double pz = player.getZ();
+                    double dx = tx - px;
+                    double dy = ty - py;
+                    double dz = tz - pz;
+                    double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+                    if (dist < 1.5) {
+                        client.execute(() -> releaseAllKeys(client));
+                        System.out.println("[MC-Control] Reached target");
+                        return;
+                    }
+
+                    // 计算朝向
+                    double yaw = Math.toDegrees(Math.atan2(-dx, dz));
+                    double pitch = Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+
+                    // 卡住检测
+                    double moved = Math.abs(player.getX() - lastX) + Math.abs(player.getZ() - lastZ);
+                    if (moved < 0.05) {
+                        stuckTicks++;
+                        if (stuckTicks == 5) {
+                            // 第一次卡住：跳
+                            jumping = true;
+                            System.out.println("[MC-Control] Stuck, jumping");
+                        } else if (stuckTicks == 15) {
+                            // 还卡：左右试探
+                            strafeDir = (strafeDir == 0) ? 1 : (strafeDir == 1 ? -1 : 1);
+                            jumping = true;
+                            System.out.println("[MC-Control] Stuck, strafing " + (strafeDir > 0 ? "left" : "right"));
+                        } else if (stuckTicks >= 30) {
+                            // 还卡：尝试挖掉前方方块
+                            System.out.println("[MC-Control] Stuck, trying to break obstacle");
+                            attemptBreakObstacle(player, tx, ty, tz);
+                            stuckTicks = 0;
+                            strafeDir = 0;
+                        }
+                    } else {
+                        stuckTicks = 0;
+                        jumping = false;
+                        strafeDir = 0;
+                    }
+                    lastX = player.getX();
+                    lastZ = player.getZ();
+
+                    // 应用移动
+                    final float fy = (float) yaw;
+                    final float fp = (float) pitch;
+                    final boolean doJump = jumping;
+                    final int sDir = strafeDir;
+
+                    client.execute(() -> {
+                        player.setYaw(fy);
+                        player.setPitch(fp);
+                        client.options.forwardKey.setPressed(true);
+                        if (doJump) client.options.jumpKey.setPressed(true);
+                        else client.options.jumpKey.setPressed(false);
+                        if (sDir > 0) {
+                            client.options.leftKey.setPressed(true);
+                            client.options.rightKey.setPressed(false);
+                        } else if (sDir < 0) {
+                            client.options.rightKey.setPressed(true);
+                            client.options.leftKey.setPressed(false);
+                        } else {
+                            client.options.leftKey.setPressed(false);
+                            client.options.rightKey.setPressed(false);
+                        }
+                    });
+                }
+
+                client.execute(() -> releaseAllKeys(client));
+                System.out.println("[MC-Control] Navigation timeout");
+            });
+        }
+
+        // 尝试破坏前方障碍物
+        private static void attemptBreakObstacle(ClientPlayerEntity player, double tx, double ty, double tz) {
+            MinecraftClient client = MinecraftClient.getInstance();
+            // 看向前方
+            HitResult hit = player.raycast(4.0, 0, false);
+            if (hit.getType() == HitResult.Type.BLOCK) {
+                BlockHitResult bHit = (BlockHitResult) hit;
+                BlockPos obstacle = bHit.getBlockPos();
+                // 避开目标方块本身
+                if (Math.abs(obstacle.getX() - tx) < 1 && 
+                    Math.abs(obstacle.getY() - ty) < 1 && 
+                    Math.abs(obstacle.getZ() - tz) < 1) {
+                    return; // 这就是目标，不挖
+                }
+                // 判断是否是"软"障碍（树叶、泥土等），可以挖掉
+                String name = player.getWorld().getBlockState(obstacle).getBlock()
+                        .getName().getString().toLowerCase();
+                boolean soft = name.contains("leaf") || name.contains("dirt") || 
+                              name.contains("grass") || name.contains("sand") ||
+                              name.contains("gravel") || name.contains("snow") ||
+                              name.contains("tall_grass") || name.contains("fern") ||
+                              name.contains("flower") || name.contains("sapling");
+                if (soft) {
+                    System.out.println("[MC-Control] Breaking soft obstacle: " + name);
+                    player.setPitch(0);
+                    digBlock(player, 3.0);
+                }
+            }
+        }
 
     // === 持续挖掘直到方块破坏，然后捡掉落物 ===
         private static void digBlock(ClientPlayerEntity player, double timeout) {

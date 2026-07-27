@@ -169,13 +169,17 @@ public class ActionExecutor {
                             String idStr = id != null ? id.toString() : "";
                             String name = state.getBlock().getName().getString();
                             if (idStr.toLowerCase().contains(blockType.toLowerCase()) ||
-                                name.toLowerCase().contains(blockType.toLowerCase())) {
-                                double dist = playerPos.getSquaredDistance(pos);
-                                if (dist < nearestDist && dist > 0.5) {
-                                    nearestDist = dist;
-                                    nearest = pos;
-                                }
-                            }
+                                                            name.toLowerCase().contains(blockType.toLowerCase())) {
+                                                            // 加权距离：垂直差 3 倍权重，优先找同高度或下方的方块
+                                                            double dx = pos.getX() - playerPos.getX();
+                                                            double dy = pos.getY() - playerPos.getY();
+                                                            double dz = pos.getZ() - playerPos.getZ();
+                                                            double weightedDist = dx*dx + dz*dz + (dy*dy) * 9.0;
+                                                            if (weightedDist < nearestDist && weightedDist > 0.25) {
+                                                                nearestDist = weightedDist;
+                                                                nearest = pos;
+                                                            }
+                                                        }
                         }
                     }
                 }

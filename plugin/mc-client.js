@@ -53,6 +53,12 @@ class MCClient {
             lines.push(`视线前方: ${state.looking_at_block} (${state.looking_at_pos})`);
         }
 
+        // 脚下信息
+        if (state.block_below) {
+            const ground = state.on_ground ? '在地面' : '在空中';
+            lines.push(`脚下: ${state.block_below} (${ground})`);
+        }
+
         if (state.inventory) {
             const items = state.inventory
                 .filter(i => i.name !== 'empty')

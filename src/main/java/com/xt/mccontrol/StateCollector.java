@@ -35,17 +35,25 @@ public class StateCollector {
         state.addProperty("dimension", dimKey.getValue().toString());
 
         // 视线目标（5 格内）
-        HitResult hit = player.raycast(5.0, 0, false);
-        if (hit.getType() == HitResult.Type.BLOCK) {
-            BlockHitResult blockHit = (BlockHitResult) hit;
-            BlockPos pos = blockHit.getBlockPos();
-            BlockState blockState = player.getWorld().getBlockState(pos);
-            state.addProperty("looking_at_block", blockState.getBlock().getName().getString());
-            state.addProperty("looking_at_pos", pos.toShortString());
-        } else {
-            state.addProperty("looking_at_block", "none");
-            state.addProperty("looking_at_pos", "");
-        }
+                HitResult hit = player.raycast(5.0, 0, false);
+                if (hit.getType() == HitResult.Type.BLOCK) {
+                    BlockHitResult blockHit = (BlockHitResult) hit;
+                    BlockPos pos = blockHit.getBlockPos();
+                    BlockState blockState = player.getWorld().getBlockState(pos);
+                    state.addProperty("looking_at_block", blockState.getBlock().getName().getString());
+                    state.addProperty("looking_at_pos", pos.toShortString());
+                } else {
+                    state.addProperty("looking_at_block", "none");
+                    state.addProperty("looking_at_pos", "");
+                }
+
+                // 脚下方块信息
+                BlockPos belowPos = player.getBlockPos().down();
+                BlockState belowBlock = player.getWorld().getBlockState(belowPos);
+                String belowName = belowBlock.getBlock().getName().getString();
+                state.addProperty("block_below", belowName);
+                state.addProperty("on_ground", player.isOnGround());
+                state.addProperty("y_feet", round(player.getY()));
 
         // 周围实体 — 暂时禁用（1.20.1 API 兼容性）
         JsonArray entities = new JsonArray();

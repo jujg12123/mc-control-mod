@@ -34,13 +34,14 @@ public class ActionExecutor {
                     move(player, dir, duration);
                 }
                 case "attack" -> {
-                    HitResult hit = player.raycast(5.0, 0, false);
-                    if (hit.getType() == HitResult.Type.BLOCK) {
-                        BlockHitResult blockHit = (BlockHitResult) hit;
-                        client.interactionManager.attackBlock(
-                                blockHit.getBlockPos(), blockHit.getSide());
-                    }
-                }
+                                    double duration = cmd.has("duration")
+                                            ? cmd.get("duration").getAsDouble() : 2.0;
+                                    client.options.attackKey.setPressed(true);
+                                    scheduler.schedule(() ->
+                                            client.execute(() ->
+                                                    client.options.attackKey.setPressed(false)),
+                                            (long) (duration * 1000), TimeUnit.MILLISECONDS);
+                                }
                 case "place" -> {
                     HitResult hit = player.raycast(5.0, 0, false);
                     if (hit.getType() == HitResult.Type.BLOCK) {

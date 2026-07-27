@@ -76,8 +76,18 @@ class MCControlPlugin extends Plugin {
                 type: 'function',
                 function: {
                     name: 'mc_dig',
-                    description: '挖掘/攻击视线前方的方块',
-                    parameters: { type: 'object', properties: {}, required: [] }
+                    description: '挖掘/攻击视线前方的方块，默认持续 2 秒',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            duration: {
+                                type: 'number',
+                                description: '挖掘时长（秒），木头约 2s，石头约 3-5s',
+                                default: 2.0
+                            }
+                        },
+                        required: []
+                    }
                 }
             },
             {
@@ -179,8 +189,9 @@ class MCControlPlugin extends Plugin {
             }
 
             case 'mc_dig': {
-                this.mc.sendAction({ action: 'attack' });
-                return '✅ 挖掘/攻击';
+                const { duration = 2.0 } = params || {};
+                this.mc.sendAction({ action: 'attack', duration });
+                return '✅ 挖掘 ' + duration + '秒';
             }
 
             case 'mc_place': {

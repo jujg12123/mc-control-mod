@@ -3,7 +3,7 @@
     "title": "WebSocket 地址",
     "description": "Minecraft Mod 的 WebSocket 服务地址",
     "type": "string",
-    "default": "ws://localhost:8765"
+    "default": "ws://127.0.0.1:8765"
   },
   "auto_control": {
     "title": "自动控制",

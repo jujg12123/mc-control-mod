@@ -32,7 +32,7 @@ class MCControlPlugin extends Plugin {
         if (!this.mc || !this.mc.connected) return;
 
         const stateText = this.mc.stateToText(this.mc.getState());
-        const msg = event.getText() || '';
+        const msg = event.text || '';
 
         const mcKeywords = ['mc', '我的世界', 'minecraft', '挖矿', '砍树', '建造', '合成', '背包', '方块', '挖', '矿'];
         const isMCRelated = mcKeywords.some(k => msg.toLowerCase().includes(k.toLowerCase()));
@@ -223,6 +223,72 @@ class MCControlPlugin extends Plugin {
                     description: '标记当前任务已完成',
                     parameters: { type: 'object', properties: {}, required: [] }
                 }
+            },
+            // === 新增：更多动作 ===
+            {
+                type: 'function',
+                function: {
+                    name: 'mc_digDown',
+                    description: '安全向下挖掘，会自动检测岩浆和水',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            distance: { type: 'integer', description: '向下挖几格，默认 1', default: 1 }
+                        },
+                        required: []
+                    }
+                }
+            },
+            {
+                type: 'function',
+                function: {
+                    name: 'mc_goToSurface',
+                    description: '回到地面（向上跳跃垫脚）',
+                    parameters: { type: 'object', properties: {}, required: [] }
+                }
+            },
+            {
+                type: 'function',
+                function: {
+                    name: 'mc_attackEntity',
+                    description: '攻击最近的实体（怪物、动物等）',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            type: { type: 'string', description: '实体类型，如 zombie, skeleton, cow。留空攻击任意' },
+                            range: { type: 'number', description: '搜索范围，默认 16', default: 16 }
+                        },
+                        required: []
+                    }
+                }
+            },
+            {
+                type: 'function',
+                function: {
+                    name: 'mc_equip',
+                    description: '装备物品（盔甲、盾牌等）',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            item_name: { type: 'string', description: '物品名称，如 iron_chestplate, shield' }
+                        },
+                        required: ['item_name']
+                    }
+                }
+            },
+            {
+                type: 'function',
+                function: {
+                    name: 'mc_consume',
+                    description: '吃食物或喝药水',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            item_name: { type: 'string', description: '食物名称，如 bread, apple。留空自动吃任意食物' }
+                        },
+                        required: []
+                    }
+                }
             }
         ];
     }
@@ -308,6 +374,31 @@ class MCControlPlugin extends Plugin {
                 this.stopGoal();
                 this.context.log('info', '✅ 任务完成: ' + done);
                 return '✅ 任务完成: ' + (done || '未知');
+            }
+            // === 更多动作 ===
+            case 'mc_digDown': {
+                const { distance = 1 } = params || {};
+                this.mc.sendAction({ action: 'dig_down', distance });
+                return '✅ 向下挖 ' + distance + ' 格';
+            }
+            case 'mc_goToSurface': {
+                this.mc.sendAction({ action: 'go_to_surface' });
+                return '✅ 返回地面...';
+            }
+            case 'mc_attackEntity': {
+                const { type = '', range = 16 } = params || {};
+                this.mc.sendAction({ action: 'attack_entity', type, range });
+                return '✅ 攻击' + (type ? ' ' + type : '最近实体') + '...';
+            }
+            case 'mc_equip': {
+                const { item_name } = params;
+                this.mc.sendAction({ action: 'equip', item_name });
+                return '✅ 装备 ' + item_name;
+            }
+            case 'mc_consume': {
+                const { item_name = '' } = params || {};
+                this.mc.sendAction({ action: 'consume', item_name });
+                return '✅ 吃/喝 ' + (item_name || '食物');
             }
             default:
                 return '❌ 未知工具: ' + name;

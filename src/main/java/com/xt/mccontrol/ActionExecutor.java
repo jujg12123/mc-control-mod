@@ -10,7 +10,6 @@ import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
 import java.util.concurrent.Executors;
@@ -20,8 +19,6 @@ import java.util.concurrent.TimeUnit;
 public class ActionExecutor {
     private static final ScheduledExecutorService scheduler =
             Executors.newScheduledThreadPool(4);
-    private static volatile boolean navigating = false;
-    private static volatile boolean stopNav = false;
 
     public static void execute(String commandJson) {
         try {
@@ -80,22 +77,20 @@ public class ActionExecutor {
                         player, Hand.MAIN_HAND);
                 case "drop" -> player.dropSelectedItem(false);
 
-                // === 新增：寻路 ===
+                // === 寻路：找到最近的目标方块，转向并走过去 ===
                 case "go_to_block" -> {
                     String blockType = cmd.get("block_type").getAsString();
                     double range = cmd.has("range")
-                            ? cmd.get("range").getAsDouble() : 64;
-                    navigateToBlock(player, blockType, range);
+                            ? cmd.get("range").getAsDouble() : 32;
+                    goToBlock(player, blockType, range);
                 }
                 case "go_to_pos" -> {
                     double tx = cmd.get("x").getAsDouble();
                     double ty = cmd.get("y").getAsDouble();
                     double tz = cmd.get("z").getAsDouble();
-                    navigateToPos(player, tx, ty, tz);
+                    goToPos(player, tx, ty, tz);
                 }
                 case "stop_nav" -> {
-                    stopNav = true;
-                    navigating = false;
                     releaseAllKeys(client);
                 }
 
@@ -107,8 +102,8 @@ public class ActionExecutor {
         }
     }
 
-    // === 寻路：找到最近的目标方块并走过去 ===
-    private static void navigateToBlock(ClientPlayerEntity player, String blockType, double range) {
+    // === 寻路：找到最近方块并转向走过去 ===
+    private static void goToBlock(ClientPlayerEntity player, String blockType, double range) {
         MinecraftClient client = MinecraftClient.getInstance();
         World world = player.getWorld();
         BlockPos playerPos = player.getBlockPos();
@@ -116,16 +111,17 @@ public class ActionExecutor {
         double nearestDist = Double.MAX_VALUE;
 
         int r = (int) range;
+        // 只搜索水平范围，y 轴 ±8
         for (int dx = -r; dx <= r; dx++) {
-            for (int dy = -r; dy <= r; dy++) {
+            for (int dy = -8; dy <= 8; dy++) {
                 for (int dz = -r; dz <= r; dz++) {
                     BlockPos pos = playerPos.add(dx, dy, dz);
                     BlockState state = world.getBlockState(pos);
+                    if (state.isAir()) continue;
                     String name = state.getBlock().getName().getString();
-                    if (name.toLowerCase().contains(blockType.toLowerCase()) ||
-                        name.equals(blockType)) {
+                    if (name.toLowerCase().contains(blockType.toLowerCase())) {
                         double dist = playerPos.getSquaredDistance(pos);
-                        if (dist < nearestDist) {
+                        if (dist < nearestDist && dist > 0.5) {
                             nearestDist = dist;
                             nearest = pos;
                         }
@@ -139,79 +135,42 @@ public class ActionExecutor {
             return;
         }
 
-        System.out.println("[MC-Control] Navigating to " + blockType + " at " + nearest.toShortString());
-        navigateToPos(player, nearest.getX() + 0.5, nearest.getY(), nearest.getZ() + 0.5);
+        System.out.println("[MC-Control] Found " + blockType + " at " + nearest.toShortString()
+                + " (dist=" + String.format("%.1f", Math.sqrt(nearestDist)) + ")");
+        goToPos(player, nearest.getX() + 0.5, nearest.getY(), nearest.getZ() + 0.5);
     }
 
-    // === 寻路：走到指定坐标 ===
-    private static void navigateToPos(ClientPlayerEntity player, double tx, double ty, double tz) {
-        if (navigating) {
-            stopNav = true;
-            try { Thread.sleep(100); } catch (InterruptedException e) {}
-        }
-        navigating = true;
-        stopNav = false;
+    // === 转向目标并向前走一段 ===
+    private static void goToPos(ClientPlayerEntity player, double tx, double ty, double tz) {
         MinecraftClient client = MinecraftClient.getInstance();
 
-        scheduler.execute(() -> {
-            int stuckTicks = 0;
-            double lastX = player.getX();
-            double lastZ = player.getZ();
-            int maxTicks = 600; // 30 seconds max
+        double px = player.getX();
+        double py = player.getY() + 0.5;
+        double pz = player.getZ();
 
-            for (int tick = 0; tick < maxTicks && !stopNav; tick++) {
-                double px = player.getX();
-                double py = player.getY();
-                double pz = player.getZ();
+        double dx = tx - px;
+        double dy = ty - py;
+        double dz = tz - pz;
+        double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
-                double dx = tx - px;
-                double dy = ty - py;
-                double dz = tz - pz;
-                double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        // 计算朝向
+        double yaw = Math.toDegrees(Math.atan2(-dx, dz));
+        double pitch = Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
 
-                if (dist < 1.5) {
-                    break; // Reached target
-                }
+        player.setYaw((float) yaw);
+        player.setPitch((float) pitch);
 
-                // Calculate yaw/pitch to look at target
-                double targetYaw = Math.toDegrees(Math.atan2(-dx, dz));
-                double targetPitch = Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+        // 向前走，距离越远走越久，最多 3 秒
+        double duration = Math.min(dist * 0.15, 3.0);
+        if (duration < 0.3) duration = 0.3;
 
-                final float fy = (float) targetYaw;
-                final float fp = (float) targetPitch;
+        client.options.forwardKey.setPressed(true);
+        scheduler.schedule(() ->
+                client.execute(() -> client.options.forwardKey.setPressed(false)),
+                (long) (duration * 1000), TimeUnit.MILLISECONDS);
 
-                client.execute(() -> {
-                    player.setYaw(fy);
-                    player.setPitch(fp);
-                    client.options.forwardKey.setPressed(true);
-                });
-
-                // Stuck detection
-                if (Math.abs(player.getX() - lastX) < 0.1 && Math.abs(player.getZ() - lastZ) < 0.1) {
-                    stuckTicks++;
-                    if (stuckTicks > 10) {
-                        // Jump to get unstuck
-                        client.execute(() -> {
-                            client.options.jumpKey.setPressed(true);
-                            scheduler.schedule(() ->
-                                    client.execute(() -> client.options.jumpKey.setPressed(false)),
-                                    100, TimeUnit.MILLISECONDS);
-                        });
-                        stuckTicks = 0;
-                    }
-                } else {
-                    stuckTicks = 0;
-                }
-                lastX = player.getX();
-                lastZ = player.getZ();
-
-                try { Thread.sleep(50); } catch (InterruptedException e) { break; }
-            }
-
-            client.execute(() -> releaseAllKeys(client));
-            navigating = false;
-            System.out.println("[MC-Control] Navigation done");
-        });
+        System.out.println("[MC-Control] Moving toward target, dist="
+                + String.format("%.1f", dist) + " duration=" + String.format("%.1f", duration) + "s");
     }
 
     private static void releaseAllKeys(MinecraftClient client) {

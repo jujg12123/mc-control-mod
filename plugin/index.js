@@ -132,6 +132,30 @@ class MCControlPlugin extends Plugin {
                     description: '右键使用（开门、开箱子等）',
                     parameters: { type: 'object', properties: {}, required: [] }
                 }
+            },
+            {
+                type: 'function',
+                function: {
+                    name: 'mc_sneak',
+                    description: '潜行（蹲下）',
+                    parameters: { type: 'object', properties: {}, required: [] }
+                }
+            },
+            {
+                type: 'function',
+                function: {
+                    name: 'mc_unsneak',
+                    description: '取消潜行（站起来）',
+                    parameters: { type: 'object', properties: {}, required: [] }
+                }
+            },
+            {
+                type: 'function',
+                function: {
+                    name: 'mc_drop',
+                    description: '丢弃当前手持物品',
+                    parameters: { type: 'object', properties: {}, required: [] }
+                }
             }
         ];
     }
@@ -184,6 +208,21 @@ class MCControlPlugin extends Plugin {
             case 'mc_use': {
                 this.mc.sendAction({ action: 'use' });
                 return '✅ 使用';
+            }
+
+            case 'mc_sneak': {
+                this.mc.sendAction({ action: 'sneak' });
+                return '✅ 潜行';
+            }
+
+            case 'mc_unsneak': {
+                this.mc.sendAction({ action: 'unsneak' });
+                return '✅ 取消潜行';
+            }
+
+            case 'mc_drop': {
+                this.mc.sendAction({ action: 'drop' });
+                return '✅ 丢弃';
             }
 
             default:

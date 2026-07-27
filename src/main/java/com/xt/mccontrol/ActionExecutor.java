@@ -11,7 +11,9 @@ import net.minecraft.entity.Entity;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.ItemStack;
+import net.minecraft.registry.Registries;
 import net.minecraft.util.Hand;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.EntityHitResult;
 import net.minecraft.util.hit.HitResult;
@@ -149,23 +151,27 @@ public class ActionExecutor {
         double nearestDist = Double.MAX_VALUE;
 
         int r = (int) range;
-        for (int dx = -r; dx <= r; dx++) {
-            for (int dy = -8; dy <= 8; dy++) {
-                for (int dz = -r; dz <= r; dz++) {
-                    BlockPos pos = playerPos.add(dx, dy, dz);
-                    BlockState state = world.getBlockState(pos);
-                    if (state.isAir()) continue;
-                    String name = state.getBlock().getName().getString();
-                    if (name.toLowerCase().contains(blockType.toLowerCase())) {
-                        double dist = playerPos.getSquaredDistance(pos);
-                        if (dist < nearestDist && dist > 0.5) {
-                            nearestDist = dist;
-                            nearest = pos;
+                for (int dx = -r; dx <= r; dx++) {
+                    for (int dy = -8; dy <= 8; dy++) {
+                        for (int dz = -r; dz <= r; dz++) {
+                            BlockPos pos = playerPos.add(dx, dy, dz);
+                            BlockState state = world.getBlockState(pos);
+                            if (state.isAir()) continue;
+                            // 用注册 ID 匹配，兼容中文名和英文 ID
+                            Identifier id = Registries.BLOCK.getId(state.getBlock());
+                            String idStr = id != null ? id.toString() : "";
+                            String name = state.getBlock().getName().getString();
+                            if (idStr.toLowerCase().contains(blockType.toLowerCase()) ||
+                                name.toLowerCase().contains(blockType.toLowerCase())) {
+                                double dist = playerPos.getSquaredDistance(pos);
+                                if (dist < nearestDist && dist > 0.5) {
+                                    nearestDist = dist;
+                                    nearest = pos;
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
 
         if (nearest == null) {
             System.out.println("[MC-Control] No block '" + blockType + "' found");

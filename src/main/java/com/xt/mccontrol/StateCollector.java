@@ -7,6 +7,8 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.ItemStack;
+import net.minecraft.registry.Registries;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
@@ -41,17 +43,22 @@ public class StateCollector {
                     BlockPos pos = blockHit.getBlockPos();
                     BlockState blockState = player.getWorld().getBlockState(pos);
                     state.addProperty("looking_at_block", blockState.getBlock().getName().getString());
-                    state.addProperty("looking_at_pos", pos.toShortString());
-                } else {
-                    state.addProperty("looking_at_block", "none");
-                    state.addProperty("looking_at_pos", "");
-                }
+                                        Identifier blockId = Registries.BLOCK.getId(blockState.getBlock());
+                                        state.addProperty("looking_at_block_id", blockId != null ? blockId.toString() : "unknown");
+                                        state.addProperty("looking_at_pos", pos.toShortString());
+                                    } else {
+                                        state.addProperty("looking_at_block", "none");
+                                        state.addProperty("looking_at_block_id", "none");
+                                        state.addProperty("looking_at_pos", "");
+                                    }
 
-                // 脚下方块信息
-                BlockPos belowPos = player.getBlockPos().down();
-                BlockState belowBlock = player.getWorld().getBlockState(belowPos);
-                String belowName = belowBlock.getBlock().getName().getString();
-                state.addProperty("block_below", belowName);
+                                    // 脚下方块信息
+                                    BlockPos belowPos = player.getBlockPos().down();
+                                    BlockState belowBlock = player.getWorld().getBlockState(belowPos);
+                                    String belowName = belowBlock.getBlock().getName().getString();
+                                    Identifier belowId = Registries.BLOCK.getId(belowBlock.getBlock());
+                                    state.addProperty("block_below", belowName);
+                                    state.addProperty("block_below_id", belowId != null ? belowId.toString() : "unknown");
                 state.addProperty("on_ground", player.isOnGround());
                 state.addProperty("y_feet", round(player.getY()));
 

@@ -50,13 +50,15 @@ class MCClient {
         lines.push(`世界: ${state.dimension || '未知'}`);
 
         if (state.looking_at_block && state.looking_at_block !== 'none') {
-            lines.push(`视线前方: ${state.looking_at_block} (${state.looking_at_pos})`);
+            const idHint = state.looking_at_block_id ? ` [${state.looking_at_block_id}]` : '';
+            lines.push(`视线前方: ${state.looking_at_block}${idHint} (${state.looking_at_pos})`);
         }
 
         // 脚下信息
         if (state.block_below) {
+            const idHint = state.block_below_id ? ` [${state.block_below_id}]` : '';
             const ground = state.on_ground ? '在地面' : '在空中';
-            lines.push(`脚下: ${state.block_below} (${ground})`);
+            lines.push(`脚下: ${state.block_below}${idHint} (${ground})`);
         }
 
         if (state.inventory) {

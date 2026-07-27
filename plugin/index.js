@@ -166,7 +166,7 @@ class MCControlPlugin extends Plugin {
                 type: 'function',
                 function: {
                     name: 'mc_goToBlock',
-                    description: '自动寻路到最近的指定方块（如 oak_log、stone），到达后停止',
+                    description: '自动寻路到最近的指定方块。使用英文 ID（如 oak_log, stone, coal_ore）或中文名（如 橡木原木, 石头）。状态里的 [minecraft:xxx] 就是 ID',
                     parameters: {
                         type: 'object',
                         properties: {

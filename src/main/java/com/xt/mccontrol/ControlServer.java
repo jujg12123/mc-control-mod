@@ -48,4 +48,13 @@ public class ControlServer extends WebSocketServer {
             currentConnection.send(stateJson);
         }
     }
+
+    /**
+     * 发送动作执行结果给 AI 插件
+     */
+    public void sendActionResult(String resultJson) {
+        if (currentConnection != null && currentConnection.isOpen()) {
+            currentConnection.send(resultJson);
+        }
+    }
 }

@@ -31,6 +31,9 @@ public class AutoBehaviorManager {
     private static double lastX = 0, lastY = 0, lastZ = 0;
     private static long lastMoveTime = 0;
     private static volatile boolean isNavigating = false; // 由 ActionExecutor 设置
+    private static long lastJumpTime = 0;
+    private static int jumpCount = 0;
+    private static long jumpResetTime = 0;
 
     // 自卫状态
     private static long lastAttackTime = 0;
@@ -190,15 +193,11 @@ public class AutoBehaviorManager {
 
     /**
      * 当不在寻路中（isNavigating == false）时，检测玩家是否卡住。
-     * 若 3 秒内移动距离 < 0.5 格，则尝试跳跃一次脱困。
+     * 仅当玩家有移动意图（按下方向键）但 3 秒内移动距离 < 0.5 格时，才尝试跳跃脱困。
+     * 跳跃冷却 8 秒，30 秒内最多跳跃 3 次，超过则记录失败日志。
      */
     private static void checkStuck(MinecraftClient client, ClientPlayerEntity player, long now) {
         if (isNavigating) return; // 寻路中不干预
-
-        double dx = player.getX() - lastX;
-        double dy = player.getY() - lastY;
-        double dz = player.getZ() - lastZ;
-        double moved = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
         // 首次调用时初始化基准位置
         if (lastMoveTime == 0) {
@@ -208,6 +207,25 @@ public class AutoBehaviorManager {
             lastMoveTime = now;
             return;
         }
+
+        // 检查移动意图：只有玩家正在尝试移动时才判定为卡住
+        boolean tryingToMove = client.options.forwardKey.isPressed()
+                || client.options.backKey.isPressed()
+                || client.options.leftKey.isPressed()
+                || client.options.rightKey.isPressed();
+        if (!tryingToMove) {
+            // 没有移动意图，重置基准位置但不触发跳跃
+            lastX = player.getX();
+            lastY = player.getY();
+            lastZ = player.getZ();
+            lastMoveTime = now;
+            return;
+        }
+
+        double dx = player.getX() - lastX;
+        double dy = player.getY() - lastY;
+        double dz = player.getZ() - lastZ;
+        double moved = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
         if (moved > 0.5) {
             // 移动距离足够，重置基准
@@ -220,13 +238,32 @@ public class AutoBehaviorManager {
 
         // 移动距离 < 0.5 格，检查是否已持续 3 秒
         if (now - lastMoveTime > 3000) {
-            // 尝试跳跃一次脱困
-            client.options.jumpKey.setPressed(true);
-            scheduler.schedule(() ->
-                    client.execute(() -> client.options.jumpKey.setPressed(false)),
-                    300, TimeUnit.MILLISECONDS);
-            StateCollector.addBehaviorLog("自动跳跃尝试脱困");
-            // 重置计时，避免连续跳跃（等待下一次判定周期）
+            // 30 秒内跳跃次数重置
+            if (jumpResetTime == 0) {
+                jumpResetTime = now;
+            }
+            if (now - jumpResetTime > 30000) {
+                jumpCount = 0;
+                jumpResetTime = now;
+            }
+
+            // 检查冷却时间（8 秒）和跳跃次数上限（3 次）
+            if (now - lastJumpTime > 8000 && jumpCount < 3) {
+                // 尝试跳跃一次脱困
+                client.options.jumpKey.setPressed(true);
+                scheduler.schedule(() ->
+                        client.execute(() -> client.options.jumpKey.setPressed(false)),
+                        300, TimeUnit.MILLISECONDS);
+                lastJumpTime = now;
+                jumpCount++;
+                StateCollector.addBehaviorLog("自动跳跃尝试脱困");
+
+                if (jumpCount >= 3) {
+                    StateCollector.addBehaviorLog("防卡失败，连续跳跃3次仍未脱困");
+                }
+            }
+
+            // 重置计时，避免连续触发
             lastX = player.getX();
             lastY = player.getY();
             lastZ = player.getZ();

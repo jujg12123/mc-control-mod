@@ -22,6 +22,8 @@ import net.minecraft.util.math.Box;
 import net.minecraft.world.World;
 
 import java.util.List;
+import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -32,6 +34,16 @@ public class ActionExecutor {
 
     private static volatile boolean navCancelled = false;
     private static volatile long actionVersion = 0;
+
+    // 白名单：只有这些方块在导航时会被尝试破坏
+    private static final Set<String> BREAKABLE_BLOCKS = Set.of(
+        // 软质方块
+        "dirt", "grass_block", "sand", "gravel", "tall_grass", "leaves",
+        // 常见硬方块
+        "cobblestone", "stone", "oak_planks", "oak_log", "birch_log", "spruce_log",
+        // 其他常见方块
+        "netherrack", "end_stone"
+    );
 
     public static void execute(String commandJson) {
         actionVersion++; // 新动作递增版本号，取消旧的后台任务
@@ -313,6 +325,9 @@ public class ActionExecutor {
     private static void goToPos(ClientPlayerEntity player, double tx, double ty, double tz, boolean emitResult) {
         MinecraftClient client = MinecraftClient.getInstance();
 
+        // 启动前清理残留按键（尤其 sneakKey/useKey），防止潜行状态导致无法移动
+        client.execute(() -> releaseAllKeys(client));
+
         AutoBehaviorManager.setNavigating(true);
         // 在后台线程中循环追踪目标
         scheduler.execute(() -> {
@@ -365,8 +380,15 @@ public class ActionExecutor {
                     } else if (stuckTicks >= 30) {
                         // 还卡：尝试挖掉前方方块
                         System.out.println("[MC-Control] Stuck, trying to break obstacle");
-                        attemptBreakObstacle(player, tx, ty, tz);
-                        stuckTicks = 0;
+                        boolean broken = attemptBreakObstacle(player, tx, ty, tz);
+                        if (!broken) {
+                            // 不可破坏方块，尝试绕行
+                            System.out.println("[MC-Control] Obstacle unbreakable, attempting bypass");
+                            attemptBypass(client, player);
+                            stuckTicks = 20; // 绕行后延迟再尝试 break/bypass
+                        } else {
+                            stuckTicks = 0;
+                        }
                         strafeDir = 0;
                     }
                 } else {
@@ -414,9 +436,11 @@ public class ActionExecutor {
     }
 
     // 尝试破坏前方障碍物（从后台线程调用，所有 MC API 通过 client.execute 调度）
-    private static void attemptBreakObstacle(ClientPlayerEntity player, double tx, double ty, double tz) {
+    // 返回 true 表示成功破坏（或正在破坏），false 表示遇到不可破坏方块
+    private static boolean attemptBreakObstacle(ClientPlayerEntity player, double tx, double ty, double tz) {
         MinecraftClient client = MinecraftClient.getInstance();
         final boolean[] shouldBreak = {false};
+        final boolean[] isUnbreakable = {false};
         final String[] blockName = {""};
         final BlockPos[] obstaclePos = {null};
     
@@ -433,30 +457,76 @@ public class ActionExecutor {
                     Math.abs(obstacle.getZ() - tz) < 1) {
                     return; // 这就是目标，不挖
                 }
-                // 判断是否是“软”障碍（树叶、泥土等），可以挖掉
+                // 获取方块的注册名（如 "cobblestone"）
+                Identifier id = Registries.BLOCK.getId(client.player.getWorld().getBlockState(obstacle).getBlock());
+                String idStr = id != null ? id.getPath() : "";
                 String name = client.player.getWorld().getBlockState(obstacle).getBlock()
                         .getName().getString().toLowerCase();
-                boolean soft = name.contains("leaf") || name.contains("dirt") ||
-                              name.contains("grass") || name.contains("sand") ||
-                              name.contains("gravel") || name.contains("snow") ||
-                              name.contains("tall_grass") || name.contains("fern") ||
-                              name.contains("flower") || name.contains("sapling");
-                if (soft) {
+    
+                // 使用包含匹配，使 "leaves" 能匹配 "oak_leaves" 等变体
+                boolean breakable = false;
+                for (String key : BREAKABLE_BLOCKS) {
+                    if (idStr.contains(key)) {
+                        breakable = true;
+                        break;
+                    }
+                }
+    
+                if (breakable) {
+                    // 在白名单中，可以破坏
                     blockName[0] = name;
                     obstaclePos[0] = obstacle;
                     shouldBreak[0] = true;
                     client.player.setPitch(0);
+                } else {
+                    // 不在白名单中，视为不可破坏
+                    blockName[0] = name;
+                    isUnbreakable[0] = true;
                 }
             }
         });
     
         // 等待主线程执行完成
-        try { Thread.sleep(50); } catch (InterruptedException e) { /* ignore */ }
+        try { Thread.sleep(150); } catch (InterruptedException e) { /* ignore */ }
+    
+        if (isUnbreakable[0]) {
+            System.out.println("[MC-Control] Unbreakable obstacle: " + blockName[0]);
+            return false;
+        }
     
         if (shouldBreak[0]) {
-            System.out.println("[MC-Control] Breaking soft obstacle: " + blockName[0]);
+            System.out.println("[MC-Control] Breaking obstacle: " + blockName[0]);
             digBlock(player, 3.0);
+            return true;
         }
+    
+        return false;
+    }
+    
+    // 尝试绕行不可破坏障碍物
+    private static void attemptBypass(MinecraftClient client, ClientPlayerEntity player) {
+        client.execute(() -> {
+            // 随机选择向左或向右平移
+            Random random = new Random();
+            boolean goLeft = random.nextBoolean();
+    
+            if (goLeft) {
+                client.options.leftKey.setPressed(true);
+            } else {
+                client.options.rightKey.setPressed(true);
+            }
+            client.options.forwardKey.setPressed(true);
+    
+            // 1.5秒后释放
+            scheduler.execute(() -> {
+                try { Thread.sleep(1500); } catch (InterruptedException e) {}
+                client.execute(() -> {
+                    client.options.leftKey.setPressed(false);
+                    client.options.rightKey.setPressed(false);
+                    client.options.forwardKey.setPressed(false);
+                });
+            });
+        });
     }
 
     // === 持续挖掘直到方块破坏，然后捡掉落物 ===
@@ -606,24 +676,23 @@ public class ActionExecutor {
         BlockPos pos = player.getBlockPos();
 
         // 在主线程查找头顶方块
+        final int[] surfaceY = {pos.getY()};
         client.execute(() -> {
-            int surfaceY = pos.getY();
             for (int y = pos.getY(); y < 320; y++) {
                 BlockPos check = new BlockPos(pos.getX(), y, pos.getZ());
                 if (world.getBlockState(check).isAir()) {
-                    surfaceY = y;
+                    surfaceY[0] = y;
                     break;
                 }
             }
-            System.out.println("[MC-Control] Surface at y=" + surfaceY + ", current y=" + pos.getY());
+            System.out.println("[MC-Control] Surface at y=" + surfaceY[0] + ", current y=" + pos.getY());
 
-                        final int targetY = surfaceY; // 捕获为 final 变量
-                        // 在后台线程执行跳跃循环（需要 Thread.sleep）
-                        scheduler.execute(() -> {
-                            long myVersion = actionVersion;
-                            // 抬头向上
-                            client.execute(() -> player.setPitch(-90f));
-                            for (int y = pos.getY(); y < targetY && !navCancelled && actionVersion == myVersion; y++) {
+            // 在后台线程执行跳跃循环（需要 Thread.sleep）
+            scheduler.execute(() -> {
+                long myVersion = actionVersion;
+                // 抬头向上
+                client.execute(() -> player.setPitch(-90f));
+                for (int y = pos.getY(); y < surfaceY[0] && !navCancelled && actionVersion == myVersion; y++) {
                     client.execute(() -> client.options.jumpKey.setPressed(true));
                     try { Thread.sleep(200); } catch (InterruptedException e) { break; }
                     client.execute(() -> client.options.jumpKey.setPressed(false));
@@ -753,6 +822,7 @@ public class ActionExecutor {
         client.options.jumpKey.setPressed(false);
         client.options.sneakKey.setPressed(false);
         client.options.attackKey.setPressed(false);
+        client.options.useKey.setPressed(false);
     }
 
     private static void move(ClientPlayerEntity player, String direction, double duration) {

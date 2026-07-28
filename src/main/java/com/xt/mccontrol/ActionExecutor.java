@@ -617,12 +617,13 @@ public class ActionExecutor {
             }
             System.out.println("[MC-Control] Surface at y=" + surfaceY + ", current y=" + pos.getY());
 
-            // 在后台线程执行跳跃循环（需要 Thread.sleep）
-            scheduler.execute(() -> {
-                long myVersion = actionVersion;
-                // 抬头向上
-                client.execute(() -> player.setPitch(-90f));
-                for (int y = pos.getY(); y < surfaceY && !navCancelled && actionVersion == myVersion; y++) {
+                        final int targetY = surfaceY; // 捕获为 final 变量
+                        // 在后台线程执行跳跃循环（需要 Thread.sleep）
+                        scheduler.execute(() -> {
+                            long myVersion = actionVersion;
+                            // 抬头向上
+                            client.execute(() -> player.setPitch(-90f));
+                            for (int y = pos.getY(); y < targetY && !navCancelled && actionVersion == myVersion; y++) {
                     client.execute(() -> client.options.jumpKey.setPressed(true));
                     try { Thread.sleep(200); } catch (InterruptedException e) { break; }
                     client.execute(() -> client.options.jumpKey.setPressed(false));

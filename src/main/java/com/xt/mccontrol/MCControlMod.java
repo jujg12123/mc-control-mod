@@ -9,6 +9,10 @@ public class MCControlMod implements ClientModInitializer {
     private static long lastSendTime = 0;
     private static final long SEND_INTERVAL_MS = 200;
 
+    public static ControlServer getServer() {
+        return server;
+    }
+
     @Override
     public void onInitializeClient() {
         server = new ControlServer();
@@ -20,11 +24,15 @@ public class MCControlMod implements ClientModInitializer {
             long now = System.currentTimeMillis();
             if (now - lastSendTime > SEND_INTERVAL_MS) {
                 String stateJson = StateCollector.collect(client);
-                if (server != null) {
+                if (server != null && stateJson != null) {
                     server.sendState(stateJson);
                 }
                 lastSendTime = now;
             }
+        });
+
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            AutoBehaviorManager.tick(client);
         });
     }
 }

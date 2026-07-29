@@ -89,6 +89,33 @@ class MCControlPlugin extends Plugin {
         }
     }
 
+    // ===== LLM 请求拦截：MC 连接时移除冲突工具 =====
+
+    /**
+     * 当 MC 已连接时，从 tools 列表中移除会与 MC 控制冲突的工具
+     * （execute_code、type_text、mouse_click 等），强制 AI 只能用 mc_ 工具。
+     */
+    async onLLMRequest(request) {
+        if (!this.mc || !this.mc.connected) return;
+        if (!request || !request.tools) return;
+
+        // 需要屏蔽的工具名（按键/鼠标/代码执行类，会和 MC 控制打架）
+        const blockedTools = [
+            'execute_code', 'type_text', 'mouse_click', 'mouse_move',
+            'press_key', 'screenshot', 'keyboard'
+        ];
+
+        const before = request.tools.length;
+        request.tools = request.tools.filter(t => {
+            const name = t?.function?.name || '';
+            return !blockedTools.includes(name);
+        });
+        const removed = before - request.tools.length;
+        if (removed > 0) {
+            console.log(`[MC-Control] 已屏蔽 ${removed} 个冲突工具（MC 连接中）`);
+        }
+    }
+
     // ===== 注册 AI 工具 =====
     getTools() {
         return [
@@ -114,6 +141,8 @@ class MCControlPlugin extends Plugin {
             { type: 'function', function: { name: 'mc_attackEntity', description: '攻击最近的实体（怪物、动物等）', parameters: { type: 'object', properties: { type: { type: 'string', description: '实体类型，如 zombie, skeleton, cow。留空攻击任意' }, range: { type: 'number', description: '搜索范围，默认 16', default: 16 } }, required: [] } } },
             { type: 'function', function: { name: 'mc_equip', description: '装备物品（盔甲、盾牌等）', parameters: { type: 'object', properties: { item_name: { type: 'string', description: '物品名称，如 iron_chestplate, shield' } }, required: ['item_name'] } } },
             { type: 'function', function: { name: 'mc_consume', description: '吃食物或喝药水', parameters: { type: 'object', properties: { item_name: { type: 'string', description: '食物名称，如 bread, apple。留空自动吃任意食物' } }, required: [] } } },
+            { type: 'function', function: { name: 'mc_craft', description: '合成物品。动态查询游戏内配方并自动合成，支持所有已注册的配方（原版+模组）。传入要合成的物品 ID（如 oak_planks, crafting_table, wooden_pickaxe, iron_ingot, shield, torch 等），系统会自动查找配方、检查材料（支持标签匹配，如任意木板均可）并合成。如果找不到配方会提示。建议先用 mc_queryRecipe 查询配方了解需要什么材料', parameters: { type: 'object', properties: { recipe: { type: 'string', description: '要合成的物品 ID，如 oak_planks, crafting_table, wooden_pickaxe, iron_pickaxe, shield, torch, bread' }, count: { type: 'integer', description: '合成数量，默认 1', default: 1 } }, required: ['recipe'] } } },
+            { type: 'function', function: { name: 'mc_queryRecipe', description: '查询任意物品的合成配方。返回所需的材料、合成站（工作台/熔炉/背包等）和摆放方式。类似 JEI 物品管理器的配方查询功能。用于了解合成某个物品需要什么材料、在什么条件下合成、怎么摆放。支持原版和模组配方', parameters: { type: 'object', properties: { item: { type: 'string', description: '要查询的物品 ID，如 oak_planks, iron_ingot, diamond_pickaxe, shield' } }, required: ['item'] } } },
             { type: 'function', function: { name: 'mc_status', description: '查询 Minecraft 连接状态和当前游戏信息', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_enableAuto', description: '启用自动行为模式（自卫、防饥饿、防卡、拾取等底层自动行为）', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_disableAuto', description: '禁用自动行为模式', parameters: { type: 'object', properties: {}, required: [] } } }
@@ -213,6 +242,14 @@ class MCControlPlugin extends Plugin {
             }
             case 'mc_enableAuto': return this.sendActionAndWait({ action: 'enable_auto' });
             case 'mc_disableAuto': return this.sendActionAndWait({ action: 'disable_auto' });
+            case 'mc_craft': {
+                const { recipe, count = 1 } = params;
+                return this.sendActionAndWait({ action: 'craft', recipe, count });
+            }
+            case 'mc_queryRecipe': {
+                const { item } = params;
+                return this.sendActionAndWait({ action: 'query_recipe', item });
+            }
             default: return '未知工具: ' + name;
         }
     }
@@ -291,6 +328,11 @@ class MCControlPlugin extends Plugin {
         }
         let patch = '\n--- Minecraft 实时状态 ---\n' + this.mc.stateToText(state);
         if (this.goal) patch += '\n当前任务目标: ' + this.goal;
+        patch += '\n\n【重要规则】控制 Minecraft 时必须且只能使用 mc_ 开头的工具。'
+              + '\n禁止使用 execute_code、type_text、mouse_click、press_key 等工具模拟键盘鼠标操作。'
+              + '\n所有游戏交互（移动、挖掘、合成、攻击等）都通过 mc_ 工具完成。'
+              + '\n\n【合成系统】mc_craft 支持动态配方查询，可合成任何有配方的物品（不限于预设列表）。'
+              + '\n合成前建议先用 mc_queryRecipe 查询配方，了解需要什么材料、在什么条件下合成、怎么摆放。';
         patch += '\n--- End Minecraft ---';
         this.context.addSystemPromptPatch('mc-state', patch);
     }
@@ -307,6 +349,10 @@ class MCControlPlugin extends Plugin {
             timeout = 30000;
         } else if (action.action === 'dig_block') {
             timeout = Math.max(10000, (action.timeout || 5) * 1000 + 5000);
+        } else if (action.action === 'craft') {
+            timeout = 15000;
+        } else if (action.action === 'query_recipe') {
+            timeout = 8000;
         }
 
         return new Promise((resolve) => {

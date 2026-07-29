@@ -22,6 +22,7 @@ import net.minecraft.util.math.Box;
 import net.minecraft.world.World;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -259,6 +260,22 @@ public class ActionExecutor {
                     String itemName = cmd.has("item_name")
                             ? cmd.get("item_name").getAsString() : "";
                     consumeItem(player, itemName);
+                }
+
+                // === 合成 ===
+                case "craft" -> {
+                    String recipe = cmd.has("recipe")
+                            ? cmd.get("recipe").getAsString() : "";
+                    int count = cmd.has("count")
+                            ? cmd.get("count").getAsInt() : 1;
+                    craftItem(client, player, recipe, count);
+                }
+
+                // === 查询配方（动态） ===
+                case "query_recipe" -> {
+                    String item = cmd.has("item")
+                            ? cmd.get("item").getAsString() : "";
+                    queryRecipe(item);
                 }
 
                 default -> {
@@ -885,6 +902,116 @@ public class ActionExecutor {
                 client.execute(() -> client.options.useKey.setPressed(false)),
                 2000, TimeUnit.MILLISECONDS);
         sendResult("consume", true, "已消耗: " + foundName);
+    }
+
+    // ======================== 合成（动态配方查询） ========================
+
+    /**
+     * 自动合成物品。使用 RecipeLookup 动态查询配方，支持所有已注册的配方。
+     * 自动检查材料（支持标签匹配，如任意木板均可），扣除材料并给成品。
+     */
+    private static void craftItem(MinecraftClient client, ClientPlayerEntity player,
+                                    String recipe, int count) {
+        if (recipe.isEmpty()) {
+            sendResult("craft", false, "合成配方为空");
+            return;
+        }
+
+        // 动态查询配方
+        List<RecipeLookup.RecipeInfo> recipes = RecipeLookup.findRecipes(recipe);
+        if (recipes.isEmpty()) {
+            sendResult("craft", false,
+                "未找到 " + recipe + " 的合成配方。该物品可能需要通过其他方式获得"
+                + "（挖矿、打怪、交易等），或物品 ID 不正确。"
+                + "可用 mc_queryRecipe 工具查询。");
+            return;
+        }
+
+        // 选取最佳配方
+        RecipeLookup.RecipeInfo best = RecipeLookup.pickBestRecipe(recipes);
+
+        // 获取所需材料（含标签匹配信息）
+        List<RecipeLookup.RequiredIngredient> required =
+                RecipeLookup.getRequiredIngredients(best);
+
+        // 检查材料是否足够
+        PlayerInventory inv = player.getInventory();
+        for (RecipeLookup.RequiredIngredient req : required) {
+            int need = req.count * count;
+            int have = countItemByIngredient(inv, req.matchIds);
+            if (have < need) {
+                sendResult("craft", false,
+                    "材料不足: 需要 " + req.displayName + " ×" + need
+                    + "，仅有 " + have);
+                return;
+            }
+        }
+
+        // 扣除材料
+        for (RecipeLookup.RequiredIngredient req : required) {
+            int need = req.count * count;
+            removeItemByIngredient(inv, req.matchIds, need);
+        }
+
+        // 给成品
+        Identifier outId = best.outputItemId.contains(":")
+                ? new Identifier(best.outputItemId)
+                : new Identifier("minecraft", best.outputItemId);
+        ItemStack result = new ItemStack(Registries.ITEM.get(outId));
+        result.setCount(best.outputCount * count);
+        if (!inv.insertStack(result)) {
+            player.dropItem(result, false);
+        }
+
+        sendResult("craft", true,
+            "合成成功: " + best.outputName + " ×" + (best.outputCount * count)
+            + " (配方: " + best.type + ", 站: " + best.station + ")");
+    }
+
+    /** 查询物品的合成配方，返回配方详情供 AI 参考 */
+    private static void queryRecipe(String itemId) {
+        if (itemId.isEmpty()) {
+            sendResult("query_recipe", false, "物品 ID 为空");
+            return;
+        }
+
+        List<RecipeLookup.RecipeInfo> recipes = RecipeLookup.findRecipes(itemId);
+        String result = RecipeLookup.formatRecipeResults(itemId, recipes);
+        boolean success = !recipes.isEmpty();
+        sendResult("query_recipe", success, result);
+    }
+
+    /** 统计背包中匹配指定材料集合的物品数量（支持标签，如任意木板均可） */
+    private static int countItemByIngredient(PlayerInventory inv, Set<String> matchIds) {
+        int total = 0;
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = inv.getStack(i);
+            if (stack.isEmpty()) continue;
+            Identifier id = Registries.ITEM.getId(stack.getItem());
+            if (id != null && matchIds.contains(id.getPath())) {
+                total += stack.getCount();
+            }
+        }
+        return total;
+    }
+
+    /** 从背包移除匹配指定材料集合的物品（支持标签） */
+    private static void removeItemByIngredient(PlayerInventory inv,
+                                                Set<String> matchIds, int amount) {
+        int remaining = amount;
+        for (int i = 0; i < 36 && remaining > 0; i++) {
+            ItemStack stack = inv.getStack(i);
+            if (stack.isEmpty()) continue;
+            Identifier id = Registries.ITEM.getId(stack.getItem());
+            if (id != null && matchIds.contains(id.getPath())) {
+                int take = Math.min(stack.getCount(), remaining);
+                stack.decrement(take);
+                remaining -= take;
+                if (stack.getCount() == 0) {
+                    inv.setStack(i, ItemStack.EMPTY);
+                }
+            }
+        }
     }
 
     // ======================== 工具方法 ========================

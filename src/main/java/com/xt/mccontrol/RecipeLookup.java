@@ -5,15 +5,15 @@ import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.recipe.*;
+import net.minecraft.registry.DynamicRegistryManager;
 import net.minecraft.registry.Registries;
-import net.minecraft.registry.RegistryWrapper;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.collection.DefaultedList;
 
 import java.util.*;
 
 /**
- * 动态配方查询器。
+ * 动态配方查询器（1.20.1 API）。
  * <p>
  * 使用 Minecraft 内置的 {@link RecipeManager} 查询任意物品的合成配方，
  * 支持有序合成、无序合成、熔炼、高炉、烟熏、切石机等配方类型。
@@ -104,7 +104,9 @@ public class RecipeLookup {
         }
 
         RecipeManager rm = client.world.getRecipeManager();
-        RegistryWrapper.WrapperLookup registryAccess = client.world.getRegistryManager();
+
+        // 1.20.1: getOutput() 需要 DynamicRegistryManager 参数
+        DynamicRegistryManager registryManager = client.world.getRegistryManager();
 
         // 解析目标物品
         Identifier targetId = parseIdentifier(itemId);
@@ -113,25 +115,91 @@ public class RecipeLookup {
             return results;
         }
 
-        // 搜索合成台配方
-        findCraftingRecipes(rm, targetItem, registryAccess, results);
+        // 1.20.1: 使用 values() 遍历所有配方，按类型筛选
+        Collection<Recipe<?>> allRecipes = rm.values();
 
-        // 搜索熔炉配方
-        findCookingRecipes(rm, RecipeType.SMELTING, "smelting", "furnace",
-                targetItem, registryAccess, results);
+        for (Recipe<?> recipe : allRecipes) {
+            ItemStack output;
+            try {
+                output = recipe.getOutput(registryManager);
+            } catch (Exception e) {
+                continue;
+            }
+            if (output.getItem() != targetItem) continue;
 
-        // 搜索高炉配方
-        findCookingRecipes(rm, RecipeType.BLASTING, "blasting", "blast_furnace",
-                targetItem, registryAccess, results);
-
-        // 搜索烟熏炉配方
-        findCookingRecipes(rm, RecipeType.SMOKING, "smoking", "smoker",
-                targetItem, registryAccess, results);
-
-        // 搜索切石机配方
-        findStonecuttingRecipes(rm, targetItem, registryAccess, results);
+            RecipeInfo info = parseRecipe(recipe, registryManager);
+            if (info != null) {
+                results.add(info);
+            }
+        }
 
         return results;
+    }
+
+    /**
+     * 从一个 Recipe 对象解析出 RecipeInfo。
+     * 处理各种配方类型：有序合成、无序合成、熔炼、高炉、烟熏、切石机。
+     */
+    private static RecipeInfo parseRecipe(Recipe<?> recipe, DynamicRegistryManager registryManager) {
+        RecipeInfo info = new RecipeInfo();
+        ItemStack output;
+        try {
+            output = recipe.getOutput(registryManager);
+        } catch (Exception e) {
+            return null;
+        }
+
+        info.outputItemId = getItemId(output.getItem());
+        info.outputName = output.getName().getString();
+        info.outputCount = output.getCount();
+
+        DefaultedList<Ingredient> ings = recipe.getIngredients();
+
+        // 判断配方类型
+        if (recipe instanceof ShapedRecipe shaped) {
+            info.type = "crafting_shaped";
+            info.gridWidth = shaped.getWidth();
+            info.gridHeight = shaped.getHeight();
+            info.station = (info.gridWidth <= 2 && info.gridHeight <= 2)
+                    ? "inventory" : "crafting_table";
+            info.patternText = buildShapedPattern(ings, info.gridWidth, info.gridHeight, info.ingredients);
+        } else if (recipe instanceof ShapelessRecipe) {
+            info.type = "crafting_shapeless";
+            info.station = "crafting_table";
+            buildShapelessIngredients(ings, info.ingredients);
+        } else if (recipe instanceof StonecuttingRecipe) {
+            info.type = "stonecutting";
+            info.station = "stonecutter";
+            buildShapelessIngredients(ings, info.ingredients);
+        } else if (recipe instanceof AbstractCookingRecipe cooking) {
+            // 通过 RecipeType 判断具体炉子类型
+            RecipeType<?> rt = recipe.getType();
+            if (rt == RecipeType.SMELTING) {
+                info.type = "smelting";
+                info.station = "furnace";
+            } else if (rt == RecipeType.BLASTING) {
+                info.type = "blasting";
+                info.station = "blast_furnace";
+            } else if (rt == RecipeType.SMOKING) {
+                info.type = "smoking";
+                info.station = "smoker";
+            } else {
+                info.type = "cooking";
+                info.station = "furnace";
+            }
+            buildShapelessIngredients(ings, info.ingredients);
+        } else if (recipe instanceof SmithingTransformRecipe || recipe instanceof SmithingTrimRecipe) {
+            info.type = "smithing";
+            info.station = "smithing_table";
+            buildShapelessIngredients(ings, info.ingredients);
+        } else {
+            // 其他特殊合成配方
+            info.type = "crafting_special";
+            info.station = "crafting_table";
+            buildShapelessIngredients(ings, info.ingredients);
+        }
+
+        return info;
     }
 
     /**
@@ -209,108 +277,6 @@ public class RecipeLookup {
         /** 检查指定物品 ID 是否匹配此材料 */
         public boolean matches(String itemId) {
             return matchIds.contains(itemId);
-        }
-    }
-
-    // ======================== 内部查询方法 ========================
-
-    @SuppressWarnings("unchecked")
-    private static void findCraftingRecipes(RecipeManager rm, Item targetItem,
-            RegistryWrapper.WrapperLookup registryAccess, List<RecipeInfo> results) {
-        Collection<RecipeEntry<CraftingRecipe>> recipes = rm.listAllOfType(RecipeType.CRAFTING);
-        for (RecipeEntry<CraftingRecipe> entry : recipes) {
-            CraftingRecipe recipe = entry.value();
-            ItemStack output;
-            try {
-                output = recipe.getResult(registryAccess);
-            } catch (Exception e) {
-                continue;
-            }
-            if (output.getItem() != targetItem) continue;
-
-            RecipeInfo info = new RecipeInfo();
-            info.outputItemId = getItemId(output.getItem());
-            info.outputName = output.getName().getString();
-            info.outputCount = output.getCount();
-
-            DefaultedList<Ingredient> ings = recipe.getIngredients();
-
-            if (recipe instanceof ShapedRecipe shaped) {
-                info.type = "crafting_shaped";
-                info.gridWidth = shaped.getWidth();
-                info.gridHeight = shaped.getHeight();
-                info.station = (info.gridWidth <= 2 && info.gridHeight <= 2)
-                        ? "inventory" : "crafting_table";
-                info.patternText = buildShapedPattern(ings, info.gridWidth, info.gridHeight, info.ingredients);
-            } else if (recipe instanceof ShapelessRecipe) {
-                info.type = "crafting_shapeless";
-                info.station = "crafting_table";
-                buildShapelessIngredients(ings, info.ingredients);
-            } else {
-                // 其他特殊合成配方
-                info.type = "crafting_special";
-                info.station = "crafting_table";
-                buildShapelessIngredients(ings, info.ingredients);
-            }
-
-            results.add(info);
-        }
-    }
-
-    private static <T extends Recipe<?>> void findCookingRecipes(RecipeManager rm,
-            RecipeType<T> recipeType, String typeName, String station,
-            Item targetItem, RegistryWrapper.WrapperLookup registryAccess,
-            List<RecipeInfo> results) {
-        Collection<RecipeEntry<T>> recipes = rm.listAllOfType(recipeType);
-        for (RecipeEntry<T> entry : recipes) {
-            T recipe = entry.value();
-            ItemStack output;
-            try {
-                output = recipe.getResult(registryAccess);
-            } catch (Exception e) {
-                continue;
-            }
-            if (output.getItem() != targetItem) continue;
-
-            RecipeInfo info = new RecipeInfo();
-            info.type = typeName;
-            info.station = station;
-            info.outputItemId = getItemId(output.getItem());
-            info.outputName = output.getName().getString();
-            info.outputCount = output.getCount();
-
-            DefaultedList<Ingredient> ings = recipe.getIngredients();
-            buildShapelessIngredients(ings, info.ingredients);
-
-            results.add(info);
-        }
-    }
-
-    private static void findStonecuttingRecipes(RecipeManager rm, Item targetItem,
-            RegistryWrapper.WrapperLookup registryAccess, List<RecipeInfo> results) {
-        Collection<RecipeEntry<StonecuttingRecipe>> recipes =
-                rm.listAllOfType(RecipeType.STONECUTTING);
-        for (RecipeEntry<StonecuttingRecipe> entry : recipes) {
-            StonecuttingRecipe recipe = entry.value();
-            ItemStack output;
-            try {
-                output = recipe.getResult(registryAccess);
-            } catch (Exception e) {
-                continue;
-            }
-            if (output.getItem() != targetItem) continue;
-
-            RecipeInfo info = new RecipeInfo();
-            info.type = "stonecutting";
-            info.station = "stonecutter";
-            info.outputItemId = getItemId(output.getItem());
-            info.outputName = output.getName().getString();
-            info.outputCount = output.getCount();
-
-            DefaultedList<Ingredient> ings = recipe.getIngredients();
-            buildShapelessIngredients(ings, info.ingredients);
-
-            results.add(info);
         }
     }
 
@@ -408,15 +374,8 @@ public class RecipeLookup {
     }
 
     private static String stripNamespace(String fullId) {
-        int idx = fullIDIndexOfColon(fullId);
+        int idx = fullId.indexOf(':');
         return idx >= 0 ? fullId.substring(idx + 1) : fullId;
-    }
-
-    private static int fullIDIndexOfColon(String s) {
-        for (int i = 0; i < s.length(); i++) {
-            if (s.charAt(i) == ':') return i;
-        }
-        return -1;
     }
 
     private static String getTypeLabel(String type) {
@@ -428,6 +387,7 @@ public class RecipeLookup {
             case "blasting" -> "高炉烧炼";
             case "smoking" -> "烟熏炉烹饪";
             case "stonecutting" -> "切石机";
+            case "smithing" -> "锻造台";
             default -> type;
         };
     }
@@ -440,6 +400,7 @@ public class RecipeLookup {
             case "blast_furnace" -> "高炉";
             case "smoker" -> "烟熏炉";
             case "stonecutter" -> "切石机";
+            case "smithing_table" -> "锻造台";
             default -> station;
         };
     }

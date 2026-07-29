@@ -30,7 +30,7 @@ public class AutoBehaviorManager {
     // 防卡检测状态
     private static double lastX = 0, lastY = 0, lastZ = 0;
     private static long lastMoveTime = 0;
-    private static volatile boolean isNavigating = false; // 由 ActionExecutor 设置
+    private static volatile boolean isNavigating = false; // 已废弃：导航状态改由 ActionExecutor.actionInProgress 管理（保留字段仅供 setNavigating 兼容）
     private static long lastJumpTime = 0;
     private static int jumpCount = 0;
     private static long jumpResetTime = 0;
@@ -85,11 +85,54 @@ public class AutoBehaviorManager {
         ClientPlayerEntity player = client.player;
         World world = client.world;
 
+        // === 修复 #3：长任务进行中时自动行为让位，避免与 AI 动作抢按键 ===
+        // 仅在生命危险（<10）时允许保命逃跑，其它行为一律暂停。
+        if (ActionExecutor.isActionInProgress()) {
+            if (player.getHealth() < 10.0f) {
+                checkSelfDefenseEscape(client, player, world, now);
+            }
+            return;
+        }
+
         // 按优先级执行行为
         checkSelfDefense(client, player, world, now); // 最高优先级：保命
         checkHunger(client, player, now);             // 高优先级：维持生存
         checkStuck(client, player, now);              // 中优先级：防止卡住
         checkPickup(client, player, world, now);      // 低优先级：拾取物品
+    }
+
+    /**
+     * 长任务进行中、生命危险时的保命逃跑（不攻击，避免抢 attackKey）。
+     * 仅按 forwardKey 朝远离敌对实体的方向移动。
+     */
+    private static void checkSelfDefenseEscape(MinecraftClient client, ClientPlayerEntity player,
+                                               World world, long now) {
+        Box searchBox = new Box(player.getX() - 8, player.getY() - 4, player.getZ() - 8,
+                player.getX() + 8, player.getY() + 4, player.getZ() + 8);
+        List<Entity> entities = world.getOtherEntities(player, searchBox,
+                e -> e instanceof HostileEntity && e.isAlive());
+        if (entities.isEmpty()) return;
+
+        Entity nearest = null;
+        double nearestDist = Double.MAX_VALUE;
+        for (Entity e : entities) {
+            double dist = e.squaredDistanceTo(player);
+            if (dist < nearestDist) {
+                nearestDist = dist;
+                nearest = e;
+            }
+        }
+        if (nearest == null) return;
+        if (Math.sqrt(nearestDist) >= 8.0) return;
+
+        // 朝远离实体的方向跑
+        double dx = player.getX() - nearest.getX();
+        double dz = player.getZ() - nearest.getZ();
+        float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+        player.setYaw(yaw);
+        client.options.forwardKey.setPressed(true);
+        client.options.jumpKey.setPressed(true);
+        StateCollector.addBehaviorLog("任务中遇险自动逃离 " + nearest.getName().getString());
     }
 
     // ======================== 1. 自卫模式 ========================
@@ -100,7 +143,7 @@ public class AutoBehaviorManager {
      * - 4~8 格且生命值 < 10：朝反方向逃跑。
      */
     private static void checkSelfDefense(MinecraftClient client, ClientPlayerEntity player, World world, long now) {
-        if (isNavigating && player.getHealth() >= 10.0f) return; // 导航中且生命安全时不干预
+        // 长任务期间的门控已在 tick() 入口处理，这里无需再判断 isNavigating
         Box searchBox = new Box(player.getX() - 8, player.getY() - 4, player.getZ() - 8,
                 player.getX() + 8, player.getY() + 4, player.getZ() + 8);
         List<Entity> entities = world.getOtherEntities(player, searchBox,
@@ -158,7 +201,7 @@ public class AutoBehaviorManager {
      * 进食冷却 5 秒。
      */
     private static void checkHunger(MinecraftClient client, ClientPlayerEntity player, long now) {
-        if (isNavigating) return; // 导航中不进食
+        // 长任务期间已在 tick() 入口让位
         if (now - lastEatTime < EAT_COOLDOWN_MS) return;
 
         if (player.getHealth() >= 15.0f || player.getHungerManager().getFoodLevel() >= 15) return;
@@ -197,7 +240,7 @@ public class AutoBehaviorManager {
      * 跳跃冷却 8 秒，30 秒内最多跳跃 3 次，超过则记录失败日志。
      */
     private static void checkStuck(MinecraftClient client, ClientPlayerEntity player, long now) {
-        if (isNavigating) return; // 寻路中不干预
+        // 长任务期间已在 tick() 入口让位
 
         // 首次调用时初始化基准位置
         if (lastMoveTime == 0) {
@@ -279,7 +322,7 @@ public class AutoBehaviorManager {
      * 拾取冷却 2 秒。
      */
     private static void checkPickup(MinecraftClient client, ClientPlayerEntity player, World world, long now) {
-        if (isNavigating) return; // 导航中不拾取
+        // 长任务期间已在 tick() 入口让位
         if (now - lastPickupAttempt < PICKUP_COOLDOWN_MS) return;
 
         Box searchBox = new Box(player.getX() - 5, player.getY() - 2, player.getZ() - 5,
@@ -328,6 +371,11 @@ public class AutoBehaviorManager {
     }
 
     public static void setNavigating(boolean n) {
-        isNavigating = n;
+        // 已废弃：导航/动作状态现由 ActionExecutor.actionInProgress 统一管理，
+        // 此处保留空实现仅为兼容旧调用。
+    }
+
+    public static boolean isNavigating() {
+        return ActionExecutor.isActionInProgress();
     }
 }

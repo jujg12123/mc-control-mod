@@ -21,6 +21,14 @@ public class MCControlMod implements ClientModInitializer {
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (client.player == null) return;
+
+            // 推进长任务状态机（寻路/挖掘等），必须在主线程
+            ActionExecutor.tick(client);
+
+            // 自动行为（自卫/防饿/防卡/拾取）
+            AutoBehaviorManager.tick(client);
+
+            // 周期性状态上报
             long now = System.currentTimeMillis();
             if (now - lastSendTime > SEND_INTERVAL_MS) {
                 String stateJson = StateCollector.collect(client);
@@ -29,10 +37,6 @@ public class MCControlMod implements ClientModInitializer {
                 }
                 lastSendTime = now;
             }
-        });
-
-        ClientTickEvents.END_CLIENT_TICK.register(client -> {
-            AutoBehaviorManager.tick(client);
         });
     }
 }

@@ -22,32 +22,50 @@ import net.minecraft.util.math.Box;
 import net.minecraft.world.World;
 
 import java.util.List;
-import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * 动作执行器。
+ * <p>
+ * 修复要点（#1 / #2）：
+ * - 所有长动作（寻路、挖掘、下挖、回地面）改为<b>主线程 tick 驱动的状态机</b>，
+ *   由 {@link MCControlMod} 的客户端 tick 回调推进 {@link #tick(MinecraftClient)}。
+ * - 彻底消除后台线程对 player/world 对象的读取，不再用 Thread.sleep 等待
+ *   client.execute() 完成。
+ * - {@link #actionInProgress} 作为统一动作锁（#3），供 {@link AutoBehaviorManager}
+ *   判断是否应让位。
+ */
 public class ActionExecutor {
     private static final ScheduledExecutorService scheduler =
-            Executors.newScheduledThreadPool(4);
+            Executors.newScheduledThreadPool(2);
 
+    // === 任务状态机 ===
+    private interface ActionTask {
+        /**
+         * 每个客户端 tick 在主线程调用一次。
+         *
+         * @return true 表示任务完成（会自动清理 currentTask 与 actionInProgress）
+         */
+        boolean tick(MinecraftClient client, ClientPlayerEntity player);
+    }
+
+    private static ActionTask currentTask = null;
+    /** 统一动作锁：长任务进行中为 true，自动行为应让位（保命除外） */
+    private static volatile boolean actionInProgress = false;
     private static volatile boolean navCancelled = false;
     private static volatile long actionVersion = 0;
 
     // 白名单：只有这些方块在导航时会被尝试破坏
     private static final Set<String> BREAKABLE_BLOCKS = Set.of(
-        // 软质方块
         "dirt", "grass_block", "sand", "gravel", "tall_grass", "leaves",
-        // 常见硬方块
         "cobblestone", "stone", "oak_planks", "oak_log", "birch_log", "spruce_log",
-        // 其他常见方块
         "netherrack", "end_stone"
     );
 
     public static void execute(String commandJson) {
-        actionVersion++; // 新动作递增版本号，取消旧的后台任务
-        navCancelled = false; // 重置取消标志，供新动作使用
         String actionName = "unknown";
         try {
             JsonObject cmd = JsonParser.parseString(commandJson).getAsJsonObject();
@@ -56,6 +74,34 @@ public class ActionExecutor {
             MinecraftClient client = MinecraftClient.getInstance();
             ClientPlayerEntity player = client.player;
             if (player == null) return;
+
+            // --- 配置类动作：不干扰进行中的任务 ---
+            if (action.equals("enable_auto")) {
+                AutoBehaviorManager.setEnabled(true);
+                sendResult("enable_auto", true, "自动行为已启用");
+                return;
+            }
+            if (action.equals("disable_auto")) {
+                AutoBehaviorManager.setEnabled(false);
+                sendResult("disable_auto", true, "自动行为已禁用");
+                return;
+            }
+
+            // --- 停止类动作：取消当前长任务 ---
+            if (action.equals("stop_nav")) {
+                cancelCurrentTask(client);
+                sendResult("stop_nav", true, "已停止寻路");
+                return;
+            }
+
+            // --- 其它动作：先取消旧的长任务（防按键冲突），再执行 ---
+            actionVersion++;
+            navCancelled = false;
+            if (currentTask != null) {
+                releaseAllKeys(client);
+                currentTask = null;
+                actionInProgress = false;
+            }
 
             switch (action) {
                 case "move_forward" -> {
@@ -127,7 +173,6 @@ public class ActionExecutor {
                             ? Hand.OFF_HAND : Hand.MAIN_HAND;
 
                     if (duration > 0) {
-                        // 持续使用模式（如吃食物、拉弓）— 参考 consume 方法
                         client.options.useKey.setPressed(true);
                         scheduler.schedule(() ->
                                 client.execute(() ->
@@ -135,7 +180,6 @@ public class ActionExecutor {
                                 (long) (duration * 1000), TimeUnit.MILLISECONDS);
                         sendResult("use", true, "持续使用中，持续 " + duration + "秒");
                     } else {
-                        // 单次使用模式
                         HitResult hit = player.raycast(5.0, 0, false);
                         boolean interacted = false;
                         if (hit.getType() == HitResult.Type.BLOCK) {
@@ -164,7 +208,7 @@ public class ActionExecutor {
                     sendResult("drop", true, "已丢弃物品");
                 }
 
-                // === 寻路 ===
+                // === 寻路（tick 状态机） ===
                 case "go_to_block" -> {
                     String blockType = cmd.get("block_type").getAsString();
                     double range = cmd.has("range")
@@ -175,33 +219,27 @@ public class ActionExecutor {
                     double tx = cmd.get("x").getAsDouble();
                     double ty = cmd.get("y").getAsDouble();
                     double tz = cmd.get("z").getAsDouble();
-                    goToPos(player, tx, ty, tz, true);
-                }
-                case "stop_nav" -> {
-                    navCancelled = true;
-                    releaseAllKeys(client);
-                    AutoBehaviorManager.setNavigating(false);
-                    sendResult("stop_nav", true, "已停止寻路");
+                    startTask(client, new NavTask(player, tx, ty, tz, true));
                 }
 
-                // === 新增：持续挖掘直到方块破坏 ===
+                // === 持续挖掘直到破坏 ===
                 case "dig_block" -> {
                     double timeout = cmd.has("timeout")
                             ? cmd.get("timeout").getAsDouble() : 10.0;
-                    digBlock(player, timeout);
+                    startTask(client, new DigBlockTask(timeout));
                 }
 
-                // === 新增：向下挖掘（安全） ===
+                // === 向下挖掘（安全） ===
                 case "dig_down" -> {
                     int distance = cmd.has("distance")
                             ? cmd.get("distance").getAsInt() : 1;
-                    digDown(player, distance);
+                    startTask(client, new DigDownTask(distance));
                 }
 
-                // === 新增：回到地面 ===
-                case "go_to_surface" -> goToSurface(player);
+                // === 回到地面（向上挖） ===
+                case "go_to_surface" -> startTask(client, new GoToSurfaceTask());
 
-                // === 新增：攻击实体 ===
+                // === 攻击实体 ===
                 case "attack_entity" -> {
                     String type = cmd.has("type")
                             ? cmd.get("type").getAsString() : "";
@@ -210,32 +248,21 @@ public class ActionExecutor {
                     attackEntity(player, type, range);
                 }
 
-                // === 新增：装备物品 ===
+                // === 装备物品 ===
                 case "equip" -> {
                     String itemName = cmd.get("item_name").getAsString();
                     equipItem(player, itemName);
                 }
 
-                // === 新增：吃/喝 ===
+                // === 吃/喝 ===
                 case "consume" -> {
                     String itemName = cmd.has("item_name")
                             ? cmd.get("item_name").getAsString() : "";
                     consumeItem(player, itemName);
                 }
 
-                // === 自动行为管理 ===
-                case "enable_auto" -> {
-                    AutoBehaviorManager.setEnabled(true);
-                    sendResult("enable_auto", true, "自动行为已启用");
-                }
-                case "disable_auto" -> {
-                    AutoBehaviorManager.setEnabled(false);
-                    sendResult("disable_auto", true, "自动行为已禁用");
-                }
-
                 default -> {
-                    System.out.println(
-                            "[MC-Control] Unknown action: " + action);
+                    System.out.println("[MC-Control] Unknown action: " + action);
                     sendResult(action, false, "未知动作: " + action);
                 }
             }
@@ -245,7 +272,449 @@ public class ActionExecutor {
         }
     }
 
-    // === 动作结果回传 ===
+    // ======================== 任务状态机驱动 ========================
+
+    /**
+     * 由 {@link MCControlMod} 的客户端 tick 回调调用，推进当前长任务。
+     * 必须在主线程执行。
+     */
+    public static void tick(MinecraftClient client) {
+        if (currentTask == null) return;
+        ClientPlayerEntity player = client.player;
+        if (player == null) {
+            cancelCurrentTask(client);
+            return;
+        }
+        try {
+            boolean done = currentTask.tick(client, player);
+            if (done) {
+                releaseAllKeys(client);
+                currentTask = null;
+                actionInProgress = false;
+            }
+        } catch (Exception e) {
+            System.err.println("[MC-Control] Task tick error: " + e.getMessage());
+            e.printStackTrace();
+            releaseAllKeys(client);
+            currentTask = null;
+            actionInProgress = false;
+        }
+    }
+
+    /** 启动一个长任务（调用前 execute 已清理旧任务并 actionVersion++） */
+    private static void startTask(MinecraftClient client, ActionTask task) {
+        releaseAllKeys(client);
+        actionInProgress = true;
+        currentTask = task;
+    }
+
+    private static void cancelCurrentTask(MinecraftClient client) {
+        if (currentTask != null) {
+            releaseAllKeys(client);
+        }
+        currentTask = null;
+        actionInProgress = false;
+    }
+
+    /** 统一动作锁：长任务进行中时为 true */
+    public static boolean isActionInProgress() {
+        return actionInProgress;
+    }
+
+    // ======================== NavTask：寻路状态机 ========================
+
+    /**
+     * 主线程 tick 驱动的寻路。所有 player/world 读写都在主线程，无后台线程、无 sleep。
+     * 卡住时进入 BREAKING（挖障碍）或 BYPASS（绕行）子状态。
+     */
+    private static class NavTask implements ActionTask {
+        private static final int NAV = 0, BREAKING = 1, BYPASS = 2;
+        private final double tx, ty, tz;
+        private final boolean emitResult;
+        private final long myVersion;
+        private double lastX, lastZ;
+        private int stuckTicks = 0;
+        private int totalTicks = 0;
+        private final int maxTicks = 600; // 约 30 秒（20 TPS）
+        private int strafeDir = 0;        // BYPASS 方向
+        private int state = NAV;
+        private int stateTicks = 0;
+
+        NavTask(ClientPlayerEntity player, double tx, double ty, double tz, boolean emitResult) {
+            this.tx = tx; this.ty = ty; this.tz = tz;
+            this.emitResult = emitResult;
+            this.myVersion = actionVersion;
+            this.lastX = player.getX();
+            this.lastZ = player.getZ();
+        }
+
+        @Override
+        public boolean tick(MinecraftClient client, ClientPlayerEntity player) {
+            // 被新动作取消
+            if (actionVersion != myVersion || navCancelled) {
+                return true;
+            }
+
+            // ---- 子状态：挖掘障碍 ----
+            if (state == BREAKING) {
+                return tickBreaking(client, player);
+            }
+            // ---- 子状态：绕行 ----
+            if (state == BYPASS) {
+                return tickBypass(client, player);
+            }
+
+            // ---- 正常导航 ----
+            totalTicks++;
+            double px = player.getX();
+            double py = player.getY() + 0.5;
+            double pz = player.getZ();
+            double dx = tx - px;
+            double dy = ty - py;
+            double dz = tz - pz;
+            double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+            if (dist < 1.5) {
+                if (emitResult) sendResult("go_to_pos", true, "已到达目标位置");
+                return true;
+            }
+            if (totalTicks >= maxTicks) {
+                if (emitResult) sendResult("go_to_pos", false, "导航超时");
+                return true;
+            }
+
+            double yaw = Math.toDegrees(Math.atan2(-dx, dz));
+            double pitch = Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+
+            // 卡住检测
+            double moved = Math.abs(player.getX() - lastX) + Math.abs(player.getZ() - lastZ);
+            if (moved < 0.05) {
+                stuckTicks++;
+                if (stuckTicks == 5) {
+                    // 跳一下
+                    applyMove(client, player, yaw, pitch, true, 0);
+                } else if (stuckTicks == 15) {
+                    strafeDir = (strafeDir == 0) ? 1 : (strafeDir == 1 ? -1 : 1);
+                    applyMove(client, player, yaw, pitch, true, strafeDir);
+                } else if (stuckTicks >= 30) {
+                    // 尝试挖障碍
+                    BlockPos obstacle = findObstacleInFront(player, tx, ty, tz);
+                    if (obstacle != null && isBreakable(player, obstacle)) {
+                        state = BREAKING;
+                        stateTicks = 0;
+                        client.options.forwardKey.setPressed(false);
+                        client.options.attackKey.setPressed(true);
+                        return false;
+                    }
+                    // 不可破坏，绕行
+                    strafeDir = (strafeDir == 0) ? 1 : (strafeDir == 1 ? -1 : 1);
+                    state = BYPASS;
+                    stateTicks = 0;
+                    return false;
+                } else {
+                    applyMove(client, player, yaw, pitch, false, 0);
+                }
+            } else {
+                stuckTicks = 0;
+                strafeDir = 0;
+                applyMove(client, player, yaw, pitch, false, 0);
+            }
+            lastX = player.getX();
+            lastZ = player.getZ();
+            return false;
+        }
+
+        private boolean tickBreaking(MinecraftClient client, ClientPlayerEntity player) {
+            stateTicks++;
+            // 检查前方障碍是否已破坏
+            HitResult hit = player.raycast(4.0, 0, false);
+            boolean cleared = true;
+            if (hit.getType() == HitResult.Type.BLOCK) {
+                BlockPos ob = ((BlockHitResult) hit).getBlockPos();
+                if (!player.getWorld().getBlockState(ob).isAir()) {
+                    cleared = false;
+                }
+            }
+            if (cleared || stateTicks > 40) { // 最多 2 秒
+                client.options.attackKey.setPressed(false);
+                stuckTicks = 0;
+                state = NAV;
+            }
+            return false;
+        }
+
+        private boolean tickBypass(MinecraftClient client, ClientPlayerEntity player) {
+            stateTicks++;
+            // 朝目标方向但侧移绕行
+            double dx = tx - player.getX();
+            double dz = tz - player.getZ();
+            double yaw = Math.toDegrees(Math.atan2(-dx, dz));
+            player.setYaw((float) yaw);
+            client.options.forwardKey.setPressed(true);
+            if (strafeDir > 0) {
+                client.options.leftKey.setPressed(true);
+                client.options.rightKey.setPressed(false);
+            } else {
+                client.options.rightKey.setPressed(true);
+                client.options.leftKey.setPressed(false);
+            }
+            if (stateTicks > 30) { // 1.5 秒后恢复导航
+                client.options.leftKey.setPressed(false);
+                client.options.rightKey.setPressed(false);
+                stuckTicks = 20;
+                state = NAV;
+            }
+            return false;
+        }
+
+        private void applyMove(MinecraftClient client, ClientPlayerEntity player,
+                               double yaw, double pitch, boolean jump, int sDir) {
+            player.setYaw((float) yaw);
+            player.setPitch((float) pitch);
+            client.options.forwardKey.setPressed(true);
+            client.options.jumpKey.setPressed(jump);
+            if (sDir > 0) {
+                client.options.leftKey.setPressed(true);
+                client.options.rightKey.setPressed(false);
+            } else if (sDir < 0) {
+                client.options.rightKey.setPressed(true);
+                client.options.leftKey.setPressed(false);
+            } else {
+                client.options.leftKey.setPressed(false);
+                client.options.rightKey.setPressed(false);
+            }
+        }
+    }
+
+    /** 在主线程同步查找前方障碍方块（排除目标本身） */
+    private static BlockPos findObstacleInFront(ClientPlayerEntity player,
+                                                double tx, double ty, double tz) {
+        HitResult hit = player.raycast(4.0, 0, false);
+        if (hit.getType() != HitResult.Type.BLOCK) return null;
+        BlockPos ob = ((BlockHitResult) hit).getBlockPos();
+        if (Math.abs(ob.getX() - tx) < 1 &&
+            Math.abs(ob.getY() - ty) < 1 &&
+            Math.abs(ob.getZ() - tz) < 1) {
+            return null; // 这就是目标
+        }
+        return ob;
+    }
+
+    private static boolean isBreakable(ClientPlayerEntity player, BlockPos pos) {
+        BlockState state = player.getWorld().getBlockState(pos);
+        Identifier id = Registries.BLOCK.getId(state.getBlock());
+        String idStr = id != null ? id.getPath() : "";
+        for (String key : BREAKABLE_BLOCKS) {
+            if (idStr.contains(key)) return true;
+        }
+        return false;
+    }
+
+    // ======================== DigBlockTask：持续挖掘 ========================
+
+    private static class DigBlockTask implements ActionTask {
+        private final long myVersion;
+        private final long timeoutMs;
+        private final long startTime;
+        private BlockPos targetPos;
+        private boolean initialized = false;
+
+        DigBlockTask(double timeout) {
+            this.timeoutMs = (long) (timeout * 1000);
+            this.startTime = System.currentTimeMillis();
+            this.myVersion = actionVersion;
+        }
+
+        @Override
+        public boolean tick(MinecraftClient client, ClientPlayerEntity player) {
+            if (actionVersion != myVersion || navCancelled) {
+                client.options.attackKey.setPressed(false);
+                return true;
+            }
+
+            if (!initialized) {
+                HitResult hit = player.raycast(5.0, 0, false);
+                if (hit.getType() != HitResult.Type.BLOCK) {
+                    sendResult("dig_block", false, "视线内没有方块");
+                    return true;
+                }
+                targetPos = ((BlockHitResult) hit).getBlockPos();
+                BlockState s = player.getWorld().getBlockState(targetPos);
+                if (s.isAir()) {
+                    sendResult("dig_block", false, "目标方块是空气");
+                    return true;
+                }
+                System.out.println("[MC-Control] Digging " +
+                        s.getBlock().getName().getString() + " at " + targetPos.toShortString());
+                initialized = true;
+                client.options.attackKey.setPressed(true);
+                return false;
+            }
+
+            // 检查是否已破坏
+            if (player.getWorld().getBlockState(targetPos).isAir()) {
+                client.options.attackKey.setPressed(false);
+                // 延迟向前走捡掉落物（scheduler + client.execute，线程安全）
+                scheduler.schedule(() ->
+                        client.execute(() -> {
+                            client.options.forwardKey.setPressed(true);
+                            scheduler.schedule(() ->
+                                    client.execute(() -> client.options.forwardKey.setPressed(false)),
+                                    500, TimeUnit.MILLISECONDS);
+                        }), 300, TimeUnit.MILLISECONDS);
+                sendResult("dig_block", true, "方块已破坏");
+                return true;
+            }
+
+            if (System.currentTimeMillis() - startTime > timeoutMs) {
+                client.options.attackKey.setPressed(false);
+                sendResult("dig_block", false, "挖掘超时");
+                return true;
+            }
+            return false;
+        }
+    }
+
+    // ======================== DigDownTask：安全向下挖 ========================
+
+    private static class DigDownTask implements ActionTask {
+        private final int distance;
+        private final long myVersion;
+        private int current = 0;     // 已完成的格数
+        private int phase = 0;       // 0=检查并开始挖, 1=等待挖完, 2=潜行下移
+        private int phaseTicks = 0;
+        private BlockPos digPos;
+
+        DigDownTask(int distance) {
+            this.distance = distance;
+            this.myVersion = actionVersion;
+        }
+
+        @Override
+        public boolean tick(MinecraftClient client, ClientPlayerEntity player) {
+            if (actionVersion != myVersion || navCancelled) {
+                client.options.attackKey.setPressed(false);
+                client.options.sneakKey.setPressed(false);
+                client.options.forwardKey.setPressed(false);
+                return true;
+            }
+            if (current >= distance) {
+                sendResult("dig_down", true, "已向下挖掘 " + distance + " 格");
+                return true;
+            }
+
+            switch (phase) {
+                case 0: { // 检查安全 + 开始挖
+                    BlockPos pos = player.getBlockPos();
+                    digPos = pos.down(current + 1);
+                    BlockState state = player.getWorld().getBlockState(digPos);
+                    String name = state.getBlock().getName().getString().toLowerCase();
+                    if (name.contains("lava") || name.contains("water")) {
+                        sendResult("dig_down", false, "遇到危险: " + name);
+                        return true;
+                    }
+                    // 向下看并按住挖掘键
+                    player.setPitch(90f);
+                    client.options.attackKey.setPressed(true);
+                    phaseTicks = 0;
+                    phase = 1;
+                    return false;
+                }
+                case 1: { // 等待方块破坏
+                    phaseTicks++;
+                    if (player.getWorld().getBlockState(digPos).isAir()) {
+                        client.options.attackKey.setPressed(false);
+                        // 潜行下移，防止直接坠落
+                        client.options.sneakKey.setPressed(true);
+                        client.options.forwardKey.setPressed(true);
+                        phaseTicks = 0;
+                        phase = 2;
+                    } else if (phaseTicks > 100) { // 5 秒超时
+                        client.options.attackKey.setPressed(false);
+                        sendResult("dig_down", false, "挖掘超时");
+                        return true;
+                    }
+                    return false;
+                }
+                case 2: { // 下移
+                    phaseTicks++;
+                    if (phaseTicks > 8) { // ~0.4 秒
+                        client.options.forwardKey.setPressed(false);
+                        client.options.sneakKey.setPressed(false);
+                        current++;
+                        phase = 0;
+                    }
+                    return false;
+                }
+            }
+            return false;
+        }
+    }
+
+    // ======================== GoToSurfaceTask：向上挖回地面 ========================
+
+    private static class GoToSurfaceTask implements ActionTask {
+        private final long myVersion;
+        private int phaseTicks = 0;
+
+        GoToSurfaceTask() {
+            this.myVersion = actionVersion;
+        }
+
+        @Override
+        public boolean tick(MinecraftClient client, ClientPlayerEntity player) {
+            if (actionVersion != myVersion || navCancelled) return true;
+
+            BlockPos pos = player.getBlockPos();
+            // 已露天（头顶连续 air）则完成
+            if (isOpenSky(player, pos)) {
+                sendResult("go_to_surface", true, "已回到地面");
+                return true;
+            }
+
+            BlockPos above = pos.up();
+            BlockState aboveState = player.getWorld().getBlockState(above);
+            player.setPitch(-90f);
+
+            if (aboveState.isAir()) {
+                // 头顶是空气，跳跃上去
+                client.options.jumpKey.setPressed(true);
+                client.options.forwardKey.setPressed(true);
+                phaseTicks++;
+                if (phaseTicks > 10) {
+                    client.options.jumpKey.setPressed(false);
+                    client.options.forwardKey.setPressed(false);
+                    phaseTicks = 0;
+                }
+            } else {
+                // 头顶有方块，挖掉
+                client.options.attackKey.setPressed(true);
+                if (player.getWorld().getBlockState(above).isAir()) {
+                    client.options.attackKey.setPressed(false);
+                    client.options.jumpKey.setPressed(true);
+                    phaseTicks++;
+                    if (phaseTicks > 5) {
+                        client.options.jumpKey.setPressed(false);
+                        phaseTicks = 0;
+                    }
+                }
+            }
+            return false;
+        }
+
+        /** 头顶向上 20 格连续 air 视为露天 */
+        private boolean isOpenSky(ClientPlayerEntity player, BlockPos pos) {
+            for (int y = pos.getY() + 1; y < pos.getY() + 20 && y < 320; y++) {
+                if (!player.getWorld().getBlockState(new BlockPos(pos.getX(), y, pos.getZ())).isAir()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    // ======================== 动作结果回传 ========================
+
     private static void sendResult(String action, boolean success, String message) {
         try {
             ControlServer server = MCControlMod.getServer();
@@ -263,7 +732,8 @@ public class ActionExecutor {
         }
     }
 
-    // === 寻路 ===
+    // ======================== 寻路到方块（主线程同步搜索） ========================
+
     private static void goToBlock(ClientPlayerEntity player, String blockType, double range) {
         MinecraftClient client = MinecraftClient.getInstance();
         World world = player.getWorld();
@@ -271,440 +741,53 @@ public class ActionExecutor {
         int r = (int) range;
         String targetLower = blockType.toLowerCase();
 
-        // 在主线程执行搜索，避免后台线程访问 World API
-        client.execute(() -> {
-            BlockPos nearest = null;
-            double nearestDist = Double.MAX_VALUE;
-            int checked = 0;
-            int maxCheck = 10000;
+        BlockPos nearest = null;
+        double nearestDist = Double.MAX_VALUE;
+        int checked = 0;
+        int maxCheck = 10000;
 
-            // 螺旋搜索：从近到远
-            for (int radius = 1; radius <= r && checked < maxCheck; radius++) {
-                for (int dx = -radius; dx <= radius; dx++) {
-                    for (int dz = -radius; dz <= radius; dz++) {
-                        // 只处理当前环的边缘
-                        if (Math.abs(dx) != radius && Math.abs(dz) != radius) continue;
-                        for (int dy = -8; dy <= 8; dy++) {
-                            if (checked >= maxCheck) break;
-                            checked++;
-
-                            BlockPos pos = playerPos.add(dx, dy, dz);
-                            BlockState state = world.getBlockState(pos);
-                            if (state.isAir()) continue;
-
-                            Identifier id = Registries.BLOCK.getId(state.getBlock());
-                            String idStr = id != null ? id.toString() : "";
-                            String name = state.getBlock().getName().getString();
-
-                            if (idStr.toLowerCase().contains(targetLower) || name.toLowerCase().contains(targetLower)) {
-                                double hx = pos.getX() - playerPos.getX();
-                                double hy = pos.getY() - playerPos.getY();
-                                double hz = pos.getZ() - playerPos.getZ();
-                                double weightedDist = hx * hx + hz * hz + (hy * hy) * 9.0;
-                                if (weightedDist < nearestDist && weightedDist > 0.25) {
-                                    nearestDist = weightedDist;
-                                    nearest = pos;
-                                    if (weightedDist < 4.0) break;
-                                }
+        for (int radius = 1; radius <= r && checked < maxCheck; radius++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    if (Math.abs(dx) != radius && Math.abs(dz) != radius) continue;
+                    for (int dy = -8; dy <= 8; dy++) {
+                        if (checked >= maxCheck) break;
+                        checked++;
+                        BlockPos pos = playerPos.add(dx, dy, dz);
+                        BlockState state = world.getBlockState(pos);
+                        if (state.isAir()) continue;
+                        Identifier id = Registries.BLOCK.getId(state.getBlock());
+                        String idStr = id != null ? id.toString() : "";
+                        String name = state.getBlock().getName().getString();
+                        if (idStr.toLowerCase().contains(targetLower) || name.toLowerCase().contains(targetLower)) {
+                            double hx = pos.getX() - playerPos.getX();
+                            double hy = pos.getY() - playerPos.getY();
+                            double hz = pos.getZ() - playerPos.getZ();
+                            double wd = hx * hx + hz * hz + (hy * hy) * 9.0;
+                            if (wd < nearestDist && wd > 0.25) {
+                                nearestDist = wd;
+                                nearest = pos;
+                                if (wd < 4.0) break;
                             }
                         }
                     }
                 }
             }
-
-            if (nearest != null) {
-                sendResult("go_to_block", true, "找到方块，开始导航");
-                goToPos(player, nearest.getX() + 0.5, nearest.getY(), nearest.getZ() + 0.5, false);
-            } else {
-                System.out.println("[MC-Control] Block not found: " + blockType + " (checked " + checked + " blocks)");
-                sendResult("go_to_block", false, "未找到方块: " + blockType);
-            }
-        });
-    }
-
-    private static void goToPos(ClientPlayerEntity player, double tx, double ty, double tz, boolean emitResult) {
-        MinecraftClient client = MinecraftClient.getInstance();
-
-        // 启动前清理残留按键（尤其 sneakKey/useKey），防止潜行状态导致无法移动
-        client.execute(() -> releaseAllKeys(client));
-
-        AutoBehaviorManager.setNavigating(true);
-        // 在后台线程中循环追踪目标
-        scheduler.execute(() -> {
-            long myVersion = actionVersion;
-            double lastX = player.getX();
-            double lastZ = player.getZ();
-            int stuckTicks = 0;
-            int totalTicks = 0;
-            int maxTicks = 600; // 30 秒超时
-            boolean jumping = false;
-            int strafeDir = 0; // 0=直走, 1=左偏, -1=右偏
-
-            while (totalTicks < maxTicks && !navCancelled && actionVersion == myVersion) {
-                try { Thread.sleep(100); } catch (InterruptedException e) { break; }
-                totalTicks++;
-
-                double px = player.getX();
-                double py = player.getY() + 0.5;
-                double pz = player.getZ();
-                double dx = tx - px;
-                double dy = ty - py;
-                double dz = tz - pz;
-                double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-                if (dist < 1.5) {
-                    client.execute(() -> releaseAllKeys(client));
-                    System.out.println("[MC-Control] Reached target");
-                    AutoBehaviorManager.setNavigating(false);
-                    if (emitResult) sendResult("go_to_pos", true, "已到达目标位置");
-                    return;
-                }
-
-                // 计算朝向
-                double yaw = Math.toDegrees(Math.atan2(-dx, dz));
-                double pitch = Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
-
-                // 卡住检测
-                double moved = Math.abs(player.getX() - lastX) + Math.abs(player.getZ() - lastZ);
-                if (moved < 0.05) {
-                    stuckTicks++;
-                    if (stuckTicks == 5) {
-                        // 第一次卡住：跳
-                        jumping = true;
-                        System.out.println("[MC-Control] Stuck, jumping");
-                    } else if (stuckTicks == 15) {
-                        // 还卡：左右试探
-                        strafeDir = (strafeDir == 0) ? 1 : (strafeDir == 1 ? -1 : 1);
-                        jumping = true;
-                        System.out.println("[MC-Control] Stuck, strafing " + (strafeDir > 0 ? "left" : "right"));
-                    } else if (stuckTicks >= 30) {
-                        // 还卡：尝试挖掉前方方块
-                        System.out.println("[MC-Control] Stuck, trying to break obstacle");
-                        boolean broken = attemptBreakObstacle(player, tx, ty, tz);
-                        if (!broken) {
-                            // 不可破坏方块，尝试绕行
-                            System.out.println("[MC-Control] Obstacle unbreakable, attempting bypass");
-                            attemptBypass(client, player);
-                            stuckTicks = 20; // 绕行后延迟再尝试 break/bypass
-                        } else {
-                            stuckTicks = 0;
-                        }
-                        strafeDir = 0;
-                    }
-                } else {
-                    stuckTicks = 0;
-                    jumping = false;
-                    strafeDir = 0;
-                }
-                lastX = player.getX();
-                lastZ = player.getZ();
-
-                // 应用移动
-                final float fy = (float) yaw;
-                final float fp = (float) pitch;
-                final boolean doJump = jumping;
-                final int sDir = strafeDir;
-
-                client.execute(() -> {
-                    player.setYaw(fy);
-                    player.setPitch(fp);
-                    client.options.forwardKey.setPressed(true);
-                    if (doJump) client.options.jumpKey.setPressed(true);
-                    else client.options.jumpKey.setPressed(false);
-                    if (sDir > 0) {
-                        client.options.leftKey.setPressed(true);
-                        client.options.rightKey.setPressed(false);
-                    } else if (sDir < 0) {
-                        client.options.rightKey.setPressed(true);
-                        client.options.leftKey.setPressed(false);
-                    } else {
-                        client.options.leftKey.setPressed(false);
-                        client.options.rightKey.setPressed(false);
-                    }
-                });
-            }
-
-            client.execute(() -> releaseAllKeys(client));
-            if (actionVersion != myVersion) {
-                AutoBehaviorManager.setNavigating(false);
-                return; // 被新动作取消，不发结果
-            }
-            System.out.println("[MC-Control] Navigation timeout");
-            AutoBehaviorManager.setNavigating(false);
-            if (emitResult) sendResult("go_to_pos", false, "导航超时");
-        });
-    }
-
-    // 尝试破坏前方障碍物（从后台线程调用，所有 MC API 通过 client.execute 调度）
-    // 返回 true 表示成功破坏（或正在破坏），false 表示遇到不可破坏方块
-    private static boolean attemptBreakObstacle(ClientPlayerEntity player, double tx, double ty, double tz) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        final boolean[] shouldBreak = {false};
-        final boolean[] isUnbreakable = {false};
-        final String[] blockName = {""};
-        final BlockPos[] obstaclePos = {null};
-    
-        // 在主线程执行 raycast 和方块状态查询
-        client.execute(() -> {
-            if (client.player == null) return;
-            HitResult hit = client.player.raycast(4.0, 0, false);
-            if (hit.getType() == HitResult.Type.BLOCK) {
-                BlockHitResult bHit = (BlockHitResult) hit;
-                BlockPos obstacle = bHit.getBlockPos();
-                // 避开目标方块本身
-                if (Math.abs(obstacle.getX() - tx) < 1 &&
-                    Math.abs(obstacle.getY() - ty) < 1 &&
-                    Math.abs(obstacle.getZ() - tz) < 1) {
-                    return; // 这就是目标，不挖
-                }
-                // 获取方块的注册名（如 "cobblestone"）
-                Identifier id = Registries.BLOCK.getId(client.player.getWorld().getBlockState(obstacle).getBlock());
-                String idStr = id != null ? id.getPath() : "";
-                String name = client.player.getWorld().getBlockState(obstacle).getBlock()
-                        .getName().getString().toLowerCase();
-    
-                // 使用包含匹配，使 "leaves" 能匹配 "oak_leaves" 等变体
-                boolean breakable = false;
-                for (String key : BREAKABLE_BLOCKS) {
-                    if (idStr.contains(key)) {
-                        breakable = true;
-                        break;
-                    }
-                }
-    
-                if (breakable) {
-                    // 在白名单中，可以破坏
-                    blockName[0] = name;
-                    obstaclePos[0] = obstacle;
-                    shouldBreak[0] = true;
-                    client.player.setPitch(0);
-                } else {
-                    // 不在白名单中，视为不可破坏
-                    blockName[0] = name;
-                    isUnbreakable[0] = true;
-                }
-            }
-        });
-    
-        // 等待主线程执行完成
-        try { Thread.sleep(150); } catch (InterruptedException e) { /* ignore */ }
-    
-        if (isUnbreakable[0]) {
-            System.out.println("[MC-Control] Unbreakable obstacle: " + blockName[0]);
-            return false;
         }
-    
-        if (shouldBreak[0]) {
-            System.out.println("[MC-Control] Breaking obstacle: " + blockName[0]);
-            digBlock(player, 3.0);
-            return true;
+
+        if (nearest != null) {
+            // 不立即发送结果——让 NavTask 完成后发送到达/超时结果
+            // emitResult=true 使 NavTask 在到达或超时时调用 sendResult
+            startTask(client, new NavTask(player, nearest.getX() + 0.5, nearest.getY(),
+                    nearest.getZ() + 0.5, true));
+        } else {
+            System.out.println("[MC-Control] Block not found: " + blockType + " (checked " + checked + " blocks)");
+            sendResult("go_to_block", false, "未找到方块: " + blockType);
         }
-    
-        return false;
-    }
-    
-    // 尝试绕行不可破坏障碍物
-    private static void attemptBypass(MinecraftClient client, ClientPlayerEntity player) {
-        client.execute(() -> {
-            // 随机选择向左或向右平移
-            Random random = new Random();
-            boolean goLeft = random.nextBoolean();
-    
-            if (goLeft) {
-                client.options.leftKey.setPressed(true);
-            } else {
-                client.options.rightKey.setPressed(true);
-            }
-            client.options.forwardKey.setPressed(true);
-    
-            // 1.5秒后释放
-            scheduler.execute(() -> {
-                try { Thread.sleep(1500); } catch (InterruptedException e) {}
-                client.execute(() -> {
-                    client.options.leftKey.setPressed(false);
-                    client.options.rightKey.setPressed(false);
-                    client.options.forwardKey.setPressed(false);
-                });
-            });
-        });
     }
 
-    // === 持续挖掘直到方块破坏，然后捡掉落物 ===
-    private static void digBlock(ClientPlayerEntity player, double timeout) {
-        MinecraftClient client = MinecraftClient.getInstance();
+    // ======================== 攻击实体 ========================
 
-        // 在主线程执行 raycast 和初始方块状态查询（可能从后台线程调用）
-        client.execute(() -> {
-            if (client.player == null) {
-                sendResult("dig_block", false, "玩家已离线");
-                return;
-            }
-            World world = client.player.getWorld();
-
-            HitResult hit = client.player.raycast(5.0, 0, false);
-            if (hit.getType() != HitResult.Type.BLOCK) {
-                System.out.println("[MC-Control] No block in sight to dig");
-                sendResult("dig_block", false, "视线内没有方块");
-                return;
-            }
-            BlockHitResult blockHit = (BlockHitResult) hit;
-            BlockPos targetPos = blockHit.getBlockPos();
-            BlockState targetState = world.getBlockState(targetPos);
-            if (targetState.isAir()) {
-                System.out.println("[MC-Control] Target block is air");
-                sendResult("dig_block", false, "目标方块是空气");
-                return;
-            }
-            String blockName = targetState.getBlock().getName().getString();
-            System.out.println("[MC-Control] Digging " + blockName + " at " + targetPos.toShortString());
-
-            // 按住挖掘键
-            client.options.attackKey.setPressed(true);
-
-            // 用调度器定时检查方块状态并释放
-            long timeoutMs = (long) (timeout * 1000);
-            long checkInterval = 100; // 每 100ms 检查一次
-
-            scheduler.execute(() -> {
-                long myVersion = actionVersion;
-                long start = System.currentTimeMillis();
-                while (System.currentTimeMillis() - start < timeoutMs && !navCancelled && actionVersion == myVersion) {
-                    try { Thread.sleep(checkInterval); } catch (InterruptedException e) { break; }
-
-                    // 在主线程检查方块状态
-                    final boolean[] broken = {false};
-                    client.execute(() -> {
-                        if (client.player == null) return;
-                        if (client.player.getWorld().getBlockState(targetPos).isAir()) {
-                            broken[0] = true;
-                        }
-                    });
-                    try { Thread.sleep(20); } catch (InterruptedException e) { break; } // 等待主线程执行
-
-                    if (broken[0]) {
-                        // 方块已破坏
-                        client.execute(() -> {
-                            client.options.attackKey.setPressed(false);
-                            // 延迟后向前走捡掉落物
-                            scheduler.schedule(() ->
-                                    client.execute(() -> {
-                                        client.options.forwardKey.setPressed(true);
-                                        scheduler.schedule(() ->
-                                                client.execute(() -> client.options.forwardKey.setPressed(false)),
-                                                500, TimeUnit.MILLISECONDS);
-                                    }),
-                                    300, TimeUnit.MILLISECONDS);
-                        });
-                        System.out.println("[MC-Control] Block broken!");
-                        sendResult("dig_block", true, "方块已破坏");
-                        return;
-                    }
-                }
-                // 超时或取消
-                client.execute(() -> client.options.attackKey.setPressed(false));
-                if (actionVersion != myVersion) return; // 被新动作取消，不发结果
-                System.out.println("[MC-Control] Dig timed out");
-                sendResult("dig_block", false, "挖掘超时");
-            });
-        });
-    }
-
-    // === 安全向下挖（异步） ===
-    private static void digDown(ClientPlayerEntity player, int distance) {
-        MinecraftClient client = MinecraftClient.getInstance();
-
-        scheduler.execute(() -> {
-            long myVersion = actionVersion;
-            for (int i = 0; i < distance; i++) {
-                if (navCancelled || actionVersion != myVersion) {
-                    sendResult("dig_down", false, "已取消");
-                    return;
-                }
-
-                // 在主线程获取位置、检查危险、设置视角和按键
-                final int iter = i;
-                final boolean[] safe = {true};
-                final String[] hazard = {null};
-
-                client.execute(() -> {
-                    if (client.player == null) { safe[0] = false; return; }
-                    BlockPos pos = client.player.getBlockPos();
-                    BlockPos below = pos.down(iter + 1);
-                    BlockState state = client.player.getWorld().getBlockState(below);
-                    String name = state.getBlock().getName().getString();
-
-                    if (name.toLowerCase().contains("lava") || name.toLowerCase().contains("water")) {
-                        hazard[0] = name; safe[0] = false; return;
-                    }
-                    if (state.isAir() && iter > 0) {
-                        hazard[0] = "void"; safe[0] = false; return;
-                    }
-
-                    client.player.setPitch(90f);
-                    client.options.attackKey.setPressed(true);
-                });
-
-                // 等待主线程执行 + 挖掘
-                try { Thread.sleep(50); } catch (InterruptedException e) { break; }
-                if (!safe[0]) {
-                    sendResult("dig_down", false, hazard[0] != null ? "遇到危险: " + hazard[0] : "玩家已离线");
-                    return;
-                }
-                try { Thread.sleep(2500); } catch (InterruptedException e) { break; }
-
-                // 停止攻击 + 潜行移动
-                client.execute(() -> {
-                    if (client.player == null) return;
-                    client.options.attackKey.setPressed(false);
-                    client.options.sneakKey.setPressed(true);
-                    client.options.forwardKey.setPressed(true);
-                });
-                try { Thread.sleep(300); } catch (InterruptedException e) { break; }
-                client.execute(() -> {
-                    client.options.forwardKey.setPressed(false);
-                    client.options.sneakKey.setPressed(false);
-                });
-            }
-            sendResult("dig_down", true, "已向下挖掘 " + distance + " 格");
-        });
-    }
-
-    // === 回到地面（异步） ===
-    private static void goToSurface(ClientPlayerEntity player) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        World world = player.getWorld();
-        BlockPos pos = player.getBlockPos();
-
-        // 在主线程查找头顶方块
-        final int[] surfaceY = {pos.getY()};
-        client.execute(() -> {
-            for (int y = pos.getY(); y < 320; y++) {
-                BlockPos check = new BlockPos(pos.getX(), y, pos.getZ());
-                if (world.getBlockState(check).isAir()) {
-                    surfaceY[0] = y;
-                    break;
-                }
-            }
-            System.out.println("[MC-Control] Surface at y=" + surfaceY[0] + ", current y=" + pos.getY());
-
-            // 在后台线程执行跳跃循环（需要 Thread.sleep）
-            scheduler.execute(() -> {
-                long myVersion = actionVersion;
-                // 抬头向上
-                client.execute(() -> player.setPitch(-90f));
-                for (int y = pos.getY(); y < surfaceY[0] && !navCancelled && actionVersion == myVersion; y++) {
-                    client.execute(() -> client.options.jumpKey.setPressed(true));
-                    try { Thread.sleep(200); } catch (InterruptedException e) { break; }
-                    client.execute(() -> client.options.jumpKey.setPressed(false));
-                    try { Thread.sleep(100); } catch (InterruptedException e) { break; }
-                }
-                System.out.println("[MC-Control] Reached surface");
-                sendResult("go_to_surface", true, "已回到地面");
-            });
-        });
-    }
-
-    // === 攻击实体 ===
     private static void attackEntity(ClientPlayerEntity player, String type, double range) {
         MinecraftClient client = MinecraftClient.getInstance();
         World world = player.getWorld();
@@ -725,12 +808,10 @@ public class ActionExecutor {
         }
 
         if (target == null) {
-            System.out.println("[MC-Control] No entity found" + (type.isEmpty() ? "" : " of type " + type));
             sendResult("attack_entity", false, "未找到实体" + (type.isEmpty() ? "" : ": " + type));
             return;
         }
 
-        // 看向目标并攻击
         double dx = target.getX() - player.getX();
         double dy = (target.getY() + target.getHeight() / 2) - (player.getY() + player.getEyeHeight(player.getPose()));
         double dz = target.getZ() - player.getZ();
@@ -741,38 +822,33 @@ public class ActionExecutor {
         scheduler.schedule(() ->
                 client.execute(() -> client.options.attackKey.setPressed(false)),
                 1500, TimeUnit.MILLISECONDS);
-        System.out.println("[MC-Control] Attacking " + target.getName().getString());
         sendResult("attack_entity", true, "攻击 " + target.getName().getString());
     }
 
-    // === 装备物品 ===
+    // ======================== 装备物品 ========================
+
     private static void equipItem(ClientPlayerEntity player, String itemName) {
         PlayerInventory inv = player.getInventory();
         for (int i = 0; i < 36; i++) {
             ItemStack stack = inv.getStack(i);
             if (!stack.isEmpty() && stack.getItem().getName().getString()
                     .toLowerCase().contains(itemName.toLowerCase())) {
-                // 切换到该物品并右键装备
                 if (i < 9) {
                     inv.selectedSlot = i;
                 } else {
-                    // 从背包移到快捷栏
-                    MinecraftClient.getInstance().interactionManager
-                            .pickFromInventory(i);
+                    MinecraftClient.getInstance().interactionManager.pickFromInventory(i);
                 }
-                // 右键装备
                 MinecraftClient.getInstance().interactionManager
                         .interactItem(player, Hand.MAIN_HAND);
-                System.out.println("[MC-Control] Equipped " + itemName);
                 sendResult("equip", true, "已装备 " + itemName);
                 return;
             }
         }
-        System.out.println("[MC-Control] Item '" + itemName + "' not found in inventory");
         sendResult("equip", false, "未找到物品: " + itemName);
     }
 
-    // === 吃/喝 ===
+    // ======================== 吃/喝 ========================
+
     private static void consumeItem(ClientPlayerEntity player, String itemName) {
         PlayerInventory inv = player.getInventory();
         int slot = -1;
@@ -793,7 +869,6 @@ public class ActionExecutor {
             }
         }
         if (slot == -1) {
-            System.out.println("[MC-Control] No food/item found");
             sendResult("consume", false, "未找到: " + itemName);
             return;
         }
@@ -804,15 +879,15 @@ public class ActionExecutor {
             MinecraftClient.getInstance().interactionManager.pickFromInventory(slot);
         }
 
-        // 按住右键吃
         MinecraftClient client = MinecraftClient.getInstance();
         client.options.useKey.setPressed(true);
         scheduler.schedule(() ->
                 client.execute(() -> client.options.useKey.setPressed(false)),
                 2000, TimeUnit.MILLISECONDS);
-        System.out.println("[MC-Control] Consuming item in slot " + slot);
         sendResult("consume", true, "已消耗: " + foundName);
     }
+
+    // ======================== 工具方法 ========================
 
     private static void releaseAllKeys(MinecraftClient client) {
         client.options.forwardKey.setPressed(false);

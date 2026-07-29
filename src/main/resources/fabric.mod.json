@@ -3,17 +3,18 @@
   "id": "mc-control-mod",
   "version": "${version}",
   "name": "MC Control Mod",
-  "description": "WebSocket API for AI to control Minecraft client",
+  "description": "WebSocket-based Minecraft control mod for My Neuro AI integration",
   "authors": ["xt"],
   "contact": {},
   "license": "MIT",
+  "icon": "",
   "environment": "client",
   "entrypoints": {
     "client": ["com.xt.mccontrol.MCControlMod"]
   },
   "depends": {
     "fabricloader": ">=0.15.0",
-    "minecraft": "~1.20.1",
+    "minecraft": ["1.20.1"],
     "java": ">=17",
     "fabric-api": "*"
   }

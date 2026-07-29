@@ -1,10 +1,21 @@
+# Gradle
 .gradle/
 build/
-*.class
-*.jar
-*.log
-*.iml
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
 .idea/
+*.iml
+*.ipr
+*.iws
 .vscode/
-*.zip
-*.tar.gz
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Fabric
+run/
+logs/

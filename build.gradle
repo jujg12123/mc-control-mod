@@ -1,5 +1,5 @@
 plugins {
-    id 'fabric-loom' version '1.5-SNAPSHOT'
+    id 'fabric-loom' version '1.5.8'
     id 'maven-publish'
 }
 
@@ -12,6 +12,7 @@ base {
 
 repositories {
     mavenCentral()
+    maven { url 'https://maven.fabricmc.net/' }
 }
 
 dependencies {
@@ -19,34 +20,23 @@ dependencies {
     mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
-    
-    implementation 'org.java-websocket:Java-WebSocket:1.5.6'
-    include 'org.java-websocket:Java-WebSocket:1.5.6'
+    implementation "org.java-websocket:Java-WebSocket:1.5.6"
+    include "org.java-websocket:Java-WebSocket:1.5.6"
 }
 
 processResources {
     inputs.property "version", project.version
-    filteringCharset "UTF-8"
     filesMatching("fabric.mod.json") {
         expand "version": project.version
     }
 }
 
 tasks.withType(JavaCompile).configureEach {
-    it.options.encoding = "UTF-8"
     it.options.release = 17
 }
 
 java {
+    withSourcesJar()
     sourceCompatibility = JavaVersion.VERSION_17
     targetCompatibility = JavaVersion.VERSION_17
-}
-
-loom {
-    runs {
-        client {
-            client()
-            configName = "Minecraft Client"
-        }
-    }
 }

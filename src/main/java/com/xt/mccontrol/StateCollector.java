@@ -17,8 +17,11 @@ import net.minecraft.util.math.Box;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.world.World;
 
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class StateCollector {
 
@@ -73,6 +76,46 @@ public class StateCollector {
             Identifier blockId = Registries.BLOCK.getId(blockState.getBlock());
             state.addProperty("looking_at_block_id", blockId != null ? blockId.toString() : "unknown");
             state.addProperty("looking_at_pos", pos.toShortString());
+
+            // 视线前方方块周围的 5×5×5 方块扫描
+            // 以视线前方方块为中心，统计 -2~+2 范围内的方块类型和数量
+            Map<String, Integer> blockCounts = new HashMap<>();
+            Map<String, String> blockNames = new HashMap<>();
+            int airCount = 0;
+            for (int dx = -2; dx <= 2; dx++) {
+                for (int dy = -2; dy <= 2; dy++) {
+                    for (int dz = -2; dz <= 2; dz++) {
+                        BlockPos sPos = pos.add(dx, dy, dz);
+                        BlockState s = player.getWorld().getBlockState(sPos);
+                        if (s.isAir()) {
+                            airCount++;
+                        } else {
+                            Identifier sId = Registries.BLOCK.getId(s.getBlock());
+                            String shortId = sId != null ? sId.getPath() : "unknown";
+                            String displayName = s.getBlock().getName().getString();
+                            blockCounts.merge(shortId, 1, Integer::sum);
+                            blockNames.putIfAbsent(shortId, displayName);
+                        }
+                    }
+                }
+            }
+            // 按数量降序排列，最多保留 8 种方块
+            JsonArray surrounding = new JsonArray();
+            List<Map.Entry<String, Integer>> sortedEntries =
+                    new ArrayList<>(blockCounts.entrySet());
+            sortedEntries.sort((a, b) -> b.getValue().compareTo(a.getValue()));
+            int shown = 0;
+            for (Map.Entry<String, Integer> entry : sortedEntries) {
+                if (shown >= 8) break;
+                JsonObject b = new JsonObject();
+                b.addProperty("id", entry.getKey());
+                b.addProperty("name", blockNames.get(entry.getKey()));
+                b.addProperty("count", entry.getValue());
+                surrounding.add(b);
+                shown++;
+            }
+            state.add("surrounding_blocks", surrounding);
+            state.addProperty("surrounding_air", airCount);
         } else {
             state.addProperty("looking_at_block", "none");
             state.addProperty("looking_at_block_id", "none");

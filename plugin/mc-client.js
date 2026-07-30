@@ -137,6 +137,24 @@ class MCClient {
         if (state.looking_at_block && state.looking_at_block !== 'none') {
             const idHint = state.looking_at_block_id ? ` [${state.looking_at_block_id}]` : '';
             lines.push(`视线前方: ${state.looking_at_block}${idHint} (${state.looking_at_pos})`);
+
+            // 周围 5×5×5 方块信息（以视线前方方块为中心）
+            if (state.surrounding_blocks && state.surrounding_blocks.length > 0) {
+                const total = 125; // 5×5×5
+                const air = state.surrounding_air || 0;
+                const nonAir = total - air;
+                const blocks = state.surrounding_blocks.map(b => `${b.name}×${b.count}`);
+                if (air > nonAir * 2) {
+                    // 空气占多数，说明前方较空旷
+                    blocks.push(`空气×${air}`);
+                    lines.push(`周围5格: ${blocks.join(', ')} (前方较空旷)`);
+                } else if (air > 0) {
+                    blocks.push(`空气×${air}`);
+                    lines.push(`周围5格: ${blocks.join(', ')}`);
+                } else {
+                    lines.push(`周围5格: ${blocks.join(', ')} (密集区域)`);
+                }
+            }
         }
 
         // 脚下信息

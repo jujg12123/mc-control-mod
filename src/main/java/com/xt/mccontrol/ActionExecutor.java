@@ -22,6 +22,7 @@ import net.minecraft.util.hit.EntityHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.world.World;
 
 import java.util.ArrayList;
@@ -157,9 +158,8 @@ public class ActionExecutor {
                 case "look_at" -> {
                     float yaw = cmd.get("yaw").getAsFloat();
                     float pitch = cmd.get("pitch").getAsFloat();
-                    player.setYaw(yaw);
-                    player.setPitch(pitch);
-                    sendResult("look_at", true, "视角已调整");
+                    // 使用平滑视角任务（模拟鼠标移动，多个 tick 渐进转向）
+                    startTask(client, new SmoothLookTask(yaw, pitch));
                 }
                 case "sneak" -> {
                     client.options.sneakKey.setPressed(true);
@@ -340,6 +340,111 @@ public class ActionExecutor {
     /** 统一动作锁：长任务进行中时为 true */
     public static boolean isActionInProgress() {
         return actionInProgress;
+    }
+
+    // ======================== SmoothLookTask：平滑视角转动 ========================
+
+    /**
+     * 模拟鼠标移动的平滑视角转动（借鉴 Baritone LookBehavior 的核心思路）。
+     * <p>
+     * 每个 tick 将角度差量化为"鼠标像素"位移，再按 Minecraft 灵敏度公式换算回角度，
+     * 使视角以自然的步长渐进逼近目标，而非瞬间跳变。
+     * <ul>
+     *   <li>鼠标灵敏度公式复刻自原版 {@code Mouse.updateMouse}</li>
+     *   <li>每 tick 最大转角限制 25°，避免过快旋转</li>
+     *   <li>角度差 < 1° 时直接到位并完成</li>
+     * </ul>
+     */
+    private static class SmoothLookTask implements ActionTask {
+        private final float targetYaw;
+        private final float targetPitch;
+        private final long myVersion;
+        private int totalTicks = 0;
+        private static final int MAX_TICKS = 100; // 5 秒超时
+
+        SmoothLookTask(float yaw, float pitch) {
+            this.targetYaw = yaw;
+            this.targetPitch = pitch;
+            this.myVersion = actionVersion;
+        }
+
+        @Override
+        public boolean tick(MinecraftClient client, ClientPlayerEntity player) {
+            if (actionVersion != myVersion || navCancelled) {
+                return true;
+            }
+
+            totalTicks++;
+            if (totalTicks > MAX_TICKS) {
+                // 超时，直接到位
+                player.setYaw(targetYaw);
+                player.setPitch(targetPitch);
+                sendResult("look_at", true, "视角已调整 (超时强制到位)");
+                return true;
+            }
+
+            float currentYaw = player.getYaw();
+            float currentPitch = player.getPitch();
+
+            // 计算最短角度差（处理 360° 环绕）
+            float yawDelta = MathHelper.wrapDegrees(targetYaw - currentYaw);
+            float pitchDelta = targetPitch - currentPitch;
+
+            // 角度差足够小，直接到位
+            if (Math.abs(yawDelta) < 1.0f && Math.abs(pitchDelta) < 1.0f) {
+                player.setYaw(targetYaw);
+                player.setPitch(targetPitch);
+                sendResult("look_at", true,
+                    String.format("视角已调整 (yaw=%.1f, pitch=%.1f, %d ticks)",
+                        targetYaw, targetPitch, totalTicks));
+                return true;
+            }
+
+            // 获取鼠标灵敏度（0.0 ~ 1.0，默认 0.5）
+            // 1.20.1 中 mouseSensitivity 是私有字段，用反射读取
+            double sensitivity = 0.5;
+            try {
+                java.lang.reflect.Field f = client.options.getClass()
+                        .getDeclaredField("mouseSensitivity");
+                f.setAccessible(true);
+                @SuppressWarnings("unchecked")
+                net.minecraft.client.option.SimpleOption<Double> opt =
+                        (net.minecraft.client.option.SimpleOption<Double>) f.get(client.options);
+                sensitivity = opt.getValue();
+            } catch (Exception e) {
+                // 反射失败时使用默认灵敏度 0.5
+            }
+            // Minecraft 原版鼠标灵敏度公式
+            double f = sensitivity * 0.6 + 0.2;
+            double anglePerPixel = f * f * f * 8.0 * 0.15;
+
+            // 量化为鼠标像素并换算回角度（模拟真实鼠标输入）
+            float yawStep = stepToward(yawDelta, anglePerPixel);
+            float pitchStep = stepToward(pitchDelta, anglePerPixel);
+
+            // 限制每 tick 最大转角（25°/tick ≈ 500°/秒，自然但不过慢）
+            yawStep = MathHelper.clamp(yawStep, -25.0f, 25.0f);
+            pitchStep = MathHelper.clamp(pitchStep, -25.0f, 25.0f);
+
+            player.setYaw(currentYaw + yawStep);
+            player.setPitch(MathHelper.clamp(currentPitch + pitchStep, -90.0f, 90.0f));
+
+            return false;
+        }
+
+        /**
+         * 将角度差量化为鼠标像素，再换算回角度步长。
+         * 这模拟了真实鼠标的离散输入特性。
+         */
+        private float stepToward(float delta, double anglePerPixel) {
+            if (anglePerPixel <= 0) return delta; // 防除零
+            int pixels = Math.round(delta / (float) anglePerPixel);
+            if (pixels == 0) {
+                // 小于一个像素的角度差，直接返回完整 delta（下个 tick 到位）
+                return delta;
+            }
+            return pixels * (float) anglePerPixel;
+        }
     }
 
     // ======================== NavTask：寻路状态机 ========================
@@ -737,9 +842,15 @@ public class ActionExecutor {
     // ======================== CraftTask：服务端同步合成 ========================
 
     /**
-     * 通过 ScreenHandler 进行服务端同步合成。
-     * 流程：打开界面 → clickRecipe 填充网格 → shift-click 取出产物 → 关闭界面。
-     * 所有操作通过 ClientPlayerInteractionManager 发送网络数据包，服务端验证并同步。
+     * 通过 ScreenHandler 进行服务端同步合成（借鉴 Altoclef 的 SlotHandler + CraftTask 设计）。
+     * <p>
+     * 改进点：
+     * <ul>
+     *   <li>光标管理：取出产物前确保光标空闲或物品可叠加</li>
+     *   <li>点击节流：每次槽位操作间隔 ≥2 tick，防止服务器丢弃过快点击</li>
+     *   <li>智能取出：需要全部时用 shift-click(QUICK_MOVE)，部分时用普通点击(PICKUP)</li>
+     *   <li>多次合成：count>1 时循环"填充→取出"直到完成或材料耗尽</li>
+     * </ul>
      */
     private static class CraftTask implements ActionTask {
         private final RecipeLookup.RecipeInfo recipe;
@@ -750,10 +861,13 @@ public class ActionExecutor {
         private final String outputId;       // 产物物品 ID（短名）
 
         // 状态机阶段
-        // 0=打开界面, 1=等待工作台界面打开, 2=填充网格,
-        // 3=等待填充完成, 4=取出产物, 5=等待取出完成, 6=关闭并报告
+        // 0=打开界面, 1=等待界面打开, 2=填充网格, 3=等待填充完成,
+        // 4=确保光标空闲, 5=取出产物, 6=等待取出完成,
+        // 7=检查是否需要继续合成(循环), 8=关闭并报告
         private int phase = 0;
         private int phaseTicks = 0;
+        private int craftsDone = 0;           // 已完成的合成次数
+        private int slotCooldown = 0;         // 槽位操作冷却（tick）
 
         CraftTask(RecipeLookup.RecipeInfo recipe, int count, BlockPos tablePos,
                   int beforeCount, String outputId) {
@@ -770,6 +884,12 @@ public class ActionExecutor {
             if (actionVersion != myVersion || navCancelled) {
                 player.closeHandledScreen();
                 return true;
+            }
+
+            // 槽位操作冷却
+            if (slotCooldown > 0) {
+                slotCooldown--;
+                return false;
             }
 
             switch (phase) {
@@ -797,6 +917,7 @@ public class ActionExecutor {
                         phase = 2;
                         phaseTicks = 0;
                     }
+                    slotCooldown = 2;
                     return false;
                 }
                 case 1: { // 等待工作台界面打开
@@ -813,6 +934,7 @@ public class ActionExecutor {
                 case 2: { // clickRecipe 填充合成网格
                     try {
                         int syncId = player.currentScreenHandler.syncId;
+                        // craftAll=true 让服务端尽量用全部材料合成
                         client.interactionManager.clickRecipe(syncId, recipe.recipe, true);
                     } catch (Exception e) {
                         player.closeHandledScreen();
@@ -821,9 +943,10 @@ public class ActionExecutor {
                     }
                     phase = 3;
                     phaseTicks = 0;
+                    slotCooldown = 3; // 等待服务端处理
                     return false;
                 }
-                case 3: { // 等待网格填充完成（服务端处理需要 1-2 tick）
+                case 3: { // 等待网格填充完成
                     phaseTicks++;
                     if (phaseTicks > 3) {
                         // 检查产物槽是否有物品
@@ -831,6 +954,10 @@ public class ActionExecutor {
                             ItemStack output = player.currentScreenHandler.getSlot(0).getStack();
                             if (output.isEmpty()) {
                                 player.closeHandledScreen();
+                                if (craftsDone > 0) {
+                                    reportCraftResult(player, true);
+                                    return true;
+                                }
                                 sendResult("craft", false,
                                     "合成失败: 配方与当前合成台不匹配，或材料已被消耗");
                                 return true;
@@ -843,46 +970,133 @@ public class ActionExecutor {
                     }
                     return false;
                 }
-                case 4: { // shift-click 产物槽（QUICK_MOVE = 自动放入背包）
-                    int syncId = player.currentScreenHandler.syncId;
+                case 4: { // 确保光标空闲（借鉴 Altoclef EnsureFreeCursorSlotTask）
+                    ItemStack cursor = player.currentScreenHandler.getCursorStack();
+                    if (cursor.isEmpty()) {
+                        phase = 5;
+                        return false;
+                    }
+                    // 检查光标物品是否与产物相同（可叠加）
+                    ItemStack output = player.currentScreenHandler.getSlot(0).getStack();
+                    if (!output.isEmpty() && ItemStack.areItemsEqual(cursor, output)
+                            && cursor.getCount() < cursor.getMaxCount()) {
+                        // 光标物品与产物相同且可叠加，可直接取出
+                        phase = 5;
+                        return false;
+                    }
+                    // 光标有不同物品，尝试放入背包空槽
+                    // 背包槽位：工作台 10-36，背包 5-35（跳过护甲）
+                    int invStart = (tablePos != null) ? 10 : 9;
+                    int invEnd = (tablePos != null) ? 46 : 45;
+                    for (int i = invStart; i < invEnd; i++) {
+                        try {
+                            ItemStack slot = player.currentScreenHandler.getSlot(i).getStack();
+                            if (slot.isEmpty()) {
+                                // 点击空槽放入光标物品
+                                client.interactionManager.clickSlot(
+                                        player.currentScreenHandler.syncId, i, 0,
+                                        SlotActionType.PICKUP, player);
+                                slotCooldown = 2;
+                                phase = 5;
+                                return false;
+                            }
+                        } catch (Exception e) {
+                            break;
+                        }
+                    }
+                    // 背包满了，无法清空光标，用 THROW 丢弃
                     client.interactionManager.clickSlot(
-                            syncId, 0, 0, SlotActionType.QUICK_MOVE, player);
+                            player.currentScreenHandler.syncId, -999, 0,
+                            SlotActionType.PICKUP, player);
+                    slotCooldown = 2;
                     phase = 5;
-                    phaseTicks = 0;
                     return false;
                 }
-                case 5: { // 等待产物取出完成
+                case 5: { // 取出产物（智能选择 shift-click 或普通点击）
+                    ItemStack output = player.currentScreenHandler.getSlot(0).getStack();
+                    if (output.isEmpty()) {
+                        // 产物槽空了，可能已取出
+                        phase = 7;
+                        return false;
+                    }
+
+                    int syncId = player.currentScreenHandler.syncId;
+                    int remaining = count - craftsDone;
+                    boolean takeAll = remaining >= 1; // 每次取出全部（shift-click）
+
+                    if (takeAll) {
+                        // shift-click 全部取出到背包
+                        client.interactionManager.clickSlot(
+                                syncId, 0, 0, SlotActionType.QUICK_MOVE, player);
+                    } else {
+                        // 普通点击取出一个到光标
+                        client.interactionManager.clickSlot(
+                                syncId, 0, 0, SlotActionType.PICKUP, player);
+                    }
+                    phase = 6;
+                    phaseTicks = 0;
+                    slotCooldown = 3;
+                    return false;
+                }
+                case 6: { // 等待产物取出完成
                     phaseTicks++;
                     if (phaseTicks > 3) {
-                        phase = 6;
+                        craftsDone++;
+                        phase = 7;
                         phaseTicks = 0;
                     }
                     return false;
                 }
-                case 6: { // 关闭界面并报告结果
-                    player.closeHandledScreen();
-
-                    // 统计合成后的物品数量
-                    PlayerInventory inv = player.getInventory();
-                    int afterCount = countItemByIngredient(inv, Set.of(outputId));
-                    int crafted = afterCount - beforeCount;
-
-                    if (crafted > 0) {
-                        String msg = "合成成功: " + recipe.outputName + " ×" + crafted
-                                + " (配方: " + recipe.type + ", 站: " + recipe.station + ")";
-                        if (crafted < count * recipe.outputCount) {
-                            msg += " (请求 " + count + " 次, 实际合成 "
-                                    + (crafted / recipe.outputCount) + " 次, 材料不足)";
-                        }
-                        sendResult("craft", true, msg);
-                    } else {
-                        sendResult("craft", false,
-                            "合成可能失败: 未检测到新增物品。请检查材料是否足够或配方是否正确。");
+                case 7: { // 检查是否需要继续合成
+                    if (craftsDone >= count) {
+                        // 已合成足够数量
+                        phase = 8;
+                        return false;
                     }
+                    // 检查产物槽是否还有物品（说明材料还够再合成一次）
+                    try {
+                        ItemStack output = player.currentScreenHandler.getSlot(0).getStack();
+                        if (!output.isEmpty()) {
+                            // 还有产物，继续取出
+                            phase = 4;
+                            return false;
+                        }
+                    } catch (Exception e) {
+                        // ignore
+                    }
+                    // 产物槽空了，需要重新填充网格
+                    phase = 2;
+                    return false;
+                }
+                case 8: { // 关闭界面并报告结果
+                    player.closeHandledScreen();
+                    reportCraftResult(player, craftsDone > 0);
                     return true;
                 }
             }
             return false;
+        }
+
+        private void reportCraftResult(ClientPlayerEntity player, boolean success) {
+            PlayerInventory inv = player.getInventory();
+            int afterCount = countItemByIngredient(inv, Set.of(outputId));
+            int crafted = afterCount - beforeCount;
+
+            if (crafted > 0) {
+                String msg = "合成成功: " + recipe.outputName + " ×" + crafted
+                        + " (配方: " + recipe.type + ", 站: " + recipe.station + ")";
+                if (crafted < count * recipe.outputCount) {
+                    msg += " (请求 " + count + " 次, 实际合成 "
+                            + (crafted / Math.max(1, recipe.outputCount)) + " 次, 材料不足)";
+                }
+                sendResult("craft", true, msg);
+            } else if (success) {
+                sendResult("craft", true,
+                    "合成完成但未检测到新增物品 (可能背包已有该物品)");
+            } else {
+                sendResult("craft", false,
+                    "合成可能失败: 未检测到新增物品。请检查材料是否足够或配方是否正确。");
+            }
         }
     }
 

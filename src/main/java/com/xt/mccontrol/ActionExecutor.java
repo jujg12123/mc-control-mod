@@ -4,13 +4,16 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.ItemStack;
+import net.minecraft.recipe.Recipe;
 import net.minecraft.registry.Registries;
+import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
@@ -21,6 +24,7 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.world.World;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -730,6 +734,158 @@ public class ActionExecutor {
         }
     }
 
+    // ======================== CraftTask：服务端同步合成 ========================
+
+    /**
+     * 通过 ScreenHandler 进行服务端同步合成。
+     * 流程：打开界面 → clickRecipe 填充网格 → shift-click 取出产物 → 关闭界面。
+     * 所有操作通过 ClientPlayerInteractionManager 发送网络数据包，服务端验证并同步。
+     */
+    private static class CraftTask implements ActionTask {
+        private final RecipeLookup.RecipeInfo recipe;
+        private final int count;
+        private final long myVersion;
+        private final BlockPos tablePos;     // null = 背包合成, 非null = 工作台合成
+        private final int beforeCount;       // 合成前背包中该物品的数量
+        private final String outputId;       // 产物物品 ID（短名）
+
+        // 状态机阶段
+        // 0=打开界面, 1=等待工作台界面打开, 2=填充网格,
+        // 3=等待填充完成, 4=取出产物, 5=等待取出完成, 6=关闭并报告
+        private int phase = 0;
+        private int phaseTicks = 0;
+
+        CraftTask(RecipeLookup.RecipeInfo recipe, int count, BlockPos tablePos,
+                  int beforeCount, String outputId) {
+            this.recipe = recipe;
+            this.count = count;
+            this.tablePos = tablePos;
+            this.beforeCount = beforeCount;
+            this.outputId = outputId;
+            this.myVersion = actionVersion;
+        }
+
+        @Override
+        public boolean tick(MinecraftClient client, ClientPlayerEntity player) {
+            if (actionVersion != myVersion || navCancelled) {
+                player.closeHandledScreen();
+                return true;
+            }
+
+            switch (phase) {
+                case 0: { // 打开界面
+                    if (tablePos != null) {
+                        // 转向工作台并右键交互
+                        double dx = tablePos.getX() + 0.5 - player.getX();
+                        double dy = tablePos.getY() + 0.5
+                                - (player.getY() + player.getEyeHeight(player.getPose()));
+                        double dz = tablePos.getZ() + 0.5 - player.getZ();
+                        player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+                        player.setPitch((float) Math.toDegrees(
+                                -Math.atan2(dy, Math.sqrt(dx * dx + dz * dz))));
+
+                        HitResult hit = player.raycast(5.0, 0, false);
+                        if (hit.getType() == HitResult.Type.BLOCK) {
+                            client.interactionManager.interactBlock(
+                                    player, Hand.MAIN_HAND, (BlockHitResult) hit);
+                        }
+                        phase = 1;
+                        phaseTicks = 0;
+                    } else {
+                        // 背包合成：直接打开背包界面
+                        client.setScreen(new InventoryScreen(player));
+                        phase = 2;
+                        phaseTicks = 0;
+                    }
+                    return false;
+                }
+                case 1: { // 等待工作台界面打开
+                    phaseTicks++;
+                    if (client.currentScreen != null) {
+                        phase = 2;
+                        phaseTicks = 0;
+                    } else if (phaseTicks > 20) { // 1 秒超时
+                        sendResult("craft", false, "无法打开工作台界面，可能距离太远");
+                        return true;
+                    }
+                    return false;
+                }
+                case 2: { // clickRecipe 填充合成网格
+                    try {
+                        int syncId = player.currentScreenHandler.syncId;
+                        client.interactionManager.clickRecipe(syncId, recipe.recipe, true);
+                    } catch (Exception e) {
+                        player.closeHandledScreen();
+                        sendResult("craft", false, "填充合成网格失败: " + e.getMessage());
+                        return true;
+                    }
+                    phase = 3;
+                    phaseTicks = 0;
+                    return false;
+                }
+                case 3: { // 等待网格填充完成（服务端处理需要 1-2 tick）
+                    phaseTicks++;
+                    if (phaseTicks > 3) {
+                        // 检查产物槽是否有物品
+                        try {
+                            ItemStack output = player.currentScreenHandler.getSlot(0).getStack();
+                            if (output.isEmpty()) {
+                                player.closeHandledScreen();
+                                sendResult("craft", false,
+                                    "合成失败: 配方与当前合成台不匹配，或材料已被消耗");
+                                return true;
+                            }
+                        } catch (Exception e) {
+                            // 忽略检查错误，继续尝试取出
+                        }
+                        phase = 4;
+                        phaseTicks = 0;
+                    }
+                    return false;
+                }
+                case 4: { // shift-click 产物槽（QUICK_MOVE = 自动放入背包）
+                    int syncId = player.currentScreenHandler.syncId;
+                    client.interactionManager.clickSlot(
+                            syncId, 0, 0, SlotActionType.QUICK_MOVE, player);
+                    phase = 5;
+                    phaseTicks = 0;
+                    return false;
+                }
+                case 5: { // 等待产物取出完成
+                    phaseTicks++;
+                    if (phaseTicks > 3) {
+                        phase = 6;
+                        phaseTicks = 0;
+                    }
+                    return false;
+                }
+                case 6: { // 关闭界面并报告结果
+                    player.closeHandledScreen();
+
+                    // 统计合成后的物品数量
+                    PlayerInventory inv = player.getInventory();
+                    int afterCount = countItemByIngredient(inv, Set.of(outputId));
+                    int crafted = afterCount - beforeCount;
+
+                    if (crafted > 0) {
+                        String msg = "合成成功: " + recipe.outputName + " ×" + crafted
+                                + " (配方: " + recipe.type + ", 站: " + recipe.station + ")";
+                        if (crafted < count * recipe.outputCount) {
+                            msg += " (请求 " + count + " 次, 实际合成 "
+                                    + (crafted / recipe.outputCount) + " 次, 材料不足)";
+                        }
+                        sendResult("craft", true, msg);
+                    } else {
+                        sendResult("craft", false,
+                            "合成可能失败: 未检测到新增物品。请检查材料是否足够或配方是否正确。");
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
     // ======================== 动作结果回传 ========================
 
     private static void sendResult(String action, boolean success, String message) {
@@ -904,11 +1060,12 @@ public class ActionExecutor {
         sendResult("consume", true, "已消耗: " + foundName);
     }
 
-    // ======================== 合成（动态配方查询） ========================
+    // ======================== 合成（服务端同步） ========================
 
     /**
-     * 自动合成物品。使用 RecipeLookup 动态查询配方，支持所有已注册的配方。
-     * 自动检查材料（支持标签匹配，如任意木板均可），扣除材料并给成品。
+     * 自动合成物品。使用 RecipeLookup 动态查询所有配方，
+     * 逐个尝试直到找到材料足够的配方，然后通过 ScreenHandler 进行服务端同步合成。
+     * 不再直接修改客户端背包，而是通过 clickRecipe + clickSlot 发送合成数据包给服务端。
      */
     private static void craftItem(MinecraftClient client, ClientPlayerEntity player,
                                     String recipe, int count) {
@@ -917,9 +1074,9 @@ public class ActionExecutor {
             return;
         }
 
-        // 动态查询配方
-        List<RecipeLookup.RecipeInfo> recipes = RecipeLookup.findRecipes(recipe);
-        if (recipes.isEmpty()) {
+        // 动态查询所有配方
+        List<RecipeLookup.RecipeInfo> allRecipes = RecipeLookup.findRecipes(recipe);
+        if (allRecipes.isEmpty()) {
             sendResult("craft", false,
                 "未找到 " + recipe + " 的合成配方。该物品可能需要通过其他方式获得"
                 + "（挖矿、打怪、交易等），或物品 ID 不正确。"
@@ -927,45 +1084,90 @@ public class ActionExecutor {
             return;
         }
 
-        // 选取最佳配方
-        RecipeLookup.RecipeInfo best = RecipeLookup.pickBestRecipe(recipes);
+        // 筛选可在合成台/背包完成的配方（排除熔炼、切石机等）
+        List<RecipeLookup.RecipeInfo> craftableRecipes = new ArrayList<>();
+        boolean hasCookingRecipe = false;
+        for (RecipeLookup.RecipeInfo r : allRecipes) {
+            if ("crafting_shaped".equals(r.type) || "crafting_shapeless".equals(r.type)
+                    || "crafting_special".equals(r.type)) {
+                craftableRecipes.add(r);
+            } else if ("smelting".equals(r.type) || "blasting".equals(r.type)
+                    || "smoking".equals(r.type)) {
+                hasCookingRecipe = true;
+            }
+        }
 
-        // 获取所需材料（含标签匹配信息）
-        List<RecipeLookup.RequiredIngredient> required =
-                RecipeLookup.getRequiredIngredients(best);
-
-        // 检查材料是否足够
-        PlayerInventory inv = player.getInventory();
-        for (RecipeLookup.RequiredIngredient req : required) {
-            int need = req.count * count;
-            int have = countItemByIngredient(inv, req.matchIds);
-            if (have < need) {
+        if (craftableRecipes.isEmpty()) {
+            if (hasCookingRecipe) {
                 sendResult("craft", false,
-                    "材料不足: 需要 " + req.displayName + " ×" + need
-                    + "，仅有 " + have);
+                    "该物品只能通过熔炼获得，不能用工作台合成。"
+                    + "需要使用熔炉/高炉/烟熏炉，并放入燃料。");
+            } else {
+                sendResult("craft", false, "未找到可用的合成台配方。可用 mc_queryRecipe 查看所有配方。");
+            }
+            return;
+        }
+
+        PlayerInventory inv = player.getInventory();
+
+        // 逐个尝试每个配方，找到第一个材料足够的
+        RecipeLookup.RecipeInfo selected = null;
+        List<String> missingInfo = new ArrayList<>();
+
+        for (RecipeLookup.RecipeInfo r : craftableRecipes) {
+            List<RecipeLookup.RequiredIngredient> req =
+                    RecipeLookup.getRequiredIngredients(r);
+            boolean hasAll = true;
+            for (RecipeLookup.RequiredIngredient ingredient : req) {
+                int need = ingredient.count * count;
+                int have = countItemByIngredient(inv, ingredient.matchIds);
+                if (have < need) {
+                    hasAll = false;
+                    missingInfo.add(ingredient.displayName + " ×" + need + "(仅有" + have + ")");
+                    break;
+                }
+            }
+            if (hasAll) {
+                selected = r;
+                break;
+            }
+        }
+
+        if (selected == null) {
+            // 所有配方材料都不足
+            StringBuilder sb = new StringBuilder("材料不足，已尝试全部 ");
+            sb.append(craftableRecipes.size()).append(" 个配方均无法合成。");
+            sb.append("缺少的材料: ");
+            sb.append(String.join("; ", missingInfo));
+            sb.append("。可用 mc_queryRecipe 查看所有配方和所需材料。");
+            sendResult("craft", false, sb.toString());
+            return;
+        }
+
+        // 记录合成前的物品数量（用于验证合成结果）
+        String outputId = selected.outputItemId.contains(":")
+                ? selected.outputItemId.substring(selected.outputItemId.indexOf(':') + 1)
+                : selected.outputItemId;
+        int beforeCount = countItemByIngredient(inv, Set.of(outputId));
+
+        // 判断是否需要工作台
+        boolean needsTable = "crafting_table".equals(selected.station);
+        BlockPos tablePos = null;
+
+        if (needsTable) {
+            // 搜索附近的工作台（5 格范围）
+            tablePos = findNearestBlock(player, "crafting_table", 5);
+            if (tablePos == null) {
+                sendResult("craft", false,
+                    "需要工作台来合成此物品（3×3 配方），但附近没有工作台。"
+                    + "请先放置一个工作台或靠近工作台后重试。"
+                    + "如果你的背包有工作台，先用 mc_place 放置到地上。");
                 return;
             }
         }
 
-        // 扣除材料
-        for (RecipeLookup.RequiredIngredient req : required) {
-            int need = req.count * count;
-            removeItemByIngredient(inv, req.matchIds, need);
-        }
-
-        // 给成品
-        Identifier outId = best.outputItemId.contains(":")
-                ? new Identifier(best.outputItemId)
-                : new Identifier("minecraft", best.outputItemId);
-        ItemStack result = new ItemStack(Registries.ITEM.get(outId));
-        result.setCount(best.outputCount * count);
-        if (!inv.insertStack(result)) {
-            player.dropItem(result, false);
-        }
-
-        sendResult("craft", true,
-            "合成成功: " + best.outputName + " ×" + (best.outputCount * count)
-            + " (配方: " + best.type + ", 站: " + best.station + ")");
+        // 启动合成任务（tick 状态机，确保服务端同步）
+        startTask(client, new CraftTask(selected, count, tablePos, beforeCount, outputId));
     }
 
     /** 查询物品的合成配方，返回配方详情供 AI 参考 */
@@ -995,23 +1197,36 @@ public class ActionExecutor {
         return total;
     }
 
-    /** 从背包移除匹配指定材料集合的物品（支持标签） */
-    private static void removeItemByIngredient(PlayerInventory inv,
-                                                Set<String> matchIds, int amount) {
-        int remaining = amount;
-        for (int i = 0; i < 36 && remaining > 0; i++) {
-            ItemStack stack = inv.getStack(i);
-            if (stack.isEmpty()) continue;
-            Identifier id = Registries.ITEM.getId(stack.getItem());
-            if (id != null && matchIds.contains(id.getPath())) {
-                int take = Math.min(stack.getCount(), remaining);
-                stack.decrement(take);
-                remaining -= take;
-                if (stack.getCount() == 0) {
-                    inv.setStack(i, ItemStack.EMPTY);
+    /** 搜索玩家附近最近的指定方块（用于查找工作台等） */
+    private static BlockPos findNearestBlock(ClientPlayerEntity player, String blockType, int range) {
+        World world = player.getWorld();
+        BlockPos playerPos = player.getBlockPos();
+        String targetLower = blockType.toLowerCase();
+
+        BlockPos nearest = null;
+        double nearestDist = Double.MAX_VALUE;
+
+        for (int dx = -range; dx <= range; dx++) {
+            for (int dy = -2; dy <= 2; dy++) {
+                for (int dz = -range; dz <= range; dz++) {
+                    BlockPos pos = playerPos.add(dx, dy, dz);
+                    BlockState state = world.getBlockState(pos);
+                    if (state.isAir()) continue;
+                    Identifier id = Registries.BLOCK.getId(state.getBlock());
+                    String idStr = id != null ? id.toString() : "";
+                    if (idStr.toLowerCase().contains(targetLower)) {
+                        double dist = player.squaredDistanceTo(
+                                pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
+                        if (dist < nearestDist) {
+                            nearestDist = dist;
+                            nearest = pos;
+                        }
+                    }
                 }
             }
         }
+
+        return nearest;
     }
 
     // ======================== 工具方法 ========================

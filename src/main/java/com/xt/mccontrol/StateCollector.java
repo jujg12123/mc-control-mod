@@ -53,7 +53,8 @@ public class StateCollector {
         state.addProperty("y", round(player.getY()));
         state.addProperty("z", round(player.getZ()));
         state.addProperty("yaw", round(player.getYaw()));
-        state.addProperty("pitch", round(player.getPitch()));
+        // 反转 pitch: Minecraft 正值=向下看, AI 约定正值=向上看
+        state.addProperty("pitch", round(-player.getPitch()));
 
         // 生命值
         state.addProperty("health", round(player.getHealth()));

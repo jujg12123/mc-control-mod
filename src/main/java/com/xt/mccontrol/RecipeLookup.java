@@ -36,6 +36,8 @@ public class RecipeLookup {
         public String patternText;     // 摆放方式文本（仅有序合成）
         public int gridWidth;
         public int gridHeight;
+        /** 原始 Minecraft 配方对象，供 clickRecipe 使用 */
+        public Recipe<?> recipe;
 
         /** 转为 AI 可读的文本 */
         public String toText() {
@@ -142,6 +144,7 @@ public class RecipeLookup {
      */
     private static RecipeInfo parseRecipe(Recipe<?> recipe, DynamicRegistryManager registryManager) {
         RecipeInfo info = new RecipeInfo();
+        info.recipe = recipe;  // 保存原始配方对象供 clickRecipe 使用
         ItemStack output;
         try {
             output = recipe.getOutput(registryManager);
@@ -165,7 +168,12 @@ public class RecipeLookup {
             info.patternText = buildShapedPattern(ings, info.gridWidth, info.gridHeight, info.ingredients);
         } else if (recipe instanceof ShapelessRecipe) {
             info.type = "crafting_shapeless";
-            info.station = "crafting_table";
+            // ≤4 个材料的无序合成可在背包 2×2 完成，>4 需要工作台 3×3
+            int nonEmpty = 0;
+            for (Ingredient ing : ings) {
+                if (!ing.isEmpty()) nonEmpty++;
+            }
+            info.station = (nonEmpty <= 4) ? "inventory" : "crafting_table";
             buildShapelessIngredients(ings, info.ingredients);
         } else if (recipe instanceof StonecuttingRecipe) {
             info.type = "stonecutting";

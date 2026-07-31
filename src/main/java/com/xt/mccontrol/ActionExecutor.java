@@ -813,7 +813,7 @@ public class ActionExecutor {
         }
 
         /** 查找玩家正前方（行进方向）的阻挡方块：先查相邻脚部/身体高度，其次视线射线 */
-        private BlockPos findBlockInFront(ClientPlayerEntity player) {
+        BlockPos findBlockInFront(ClientPlayerEntity player) {
             World world = player.getWorld();
             BlockPos pos = player.getBlockPos();
             double rad = Math.toRadians(player.getYaw());

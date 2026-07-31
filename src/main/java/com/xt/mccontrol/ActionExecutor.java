@@ -289,7 +289,7 @@ public class ActionExecutor {
                     double tx = cmd.get("x").getAsDouble();
                     double ty = cmd.get("y").getAsDouble();
                     double tz = cmd.get("z").getAsDouble();
-                    startTask(client, new NavTask(player, tx, ty, tz, true, "go_to_pos"));
+                    startTask(client, new NavTask(player, tx, ty, tz, true, "go_to_pos"), "go_to_pos");
                 }
 
                 // === 持续挖掘直到破坏 ===
@@ -1389,7 +1389,7 @@ public class ActionExecutor {
             DefaultedList<Ingredient> ings = recipe.recipe.getIngredients();
             int gridW = (tablePos != null) ? 3 : 2;
             if (recipe.recipe instanceof ShapedRecipe shaped) {
-                List<String> pattern = shaped.getPattern();
+                List<String> pattern = shaped.getPattern(null);
                 for (int row = 0; row < pattern.size(); row++) {
                     String line = pattern.get(row);
                     for (int col = 0; col < line.length(); col++) {
@@ -1510,7 +1510,7 @@ public class ActionExecutor {
             // 不立即发送结果——让 NavTask 完成后发送到达/超时结果
             // emitResult=true 使 NavTask 在到达或超时时调用 sendResult
             startTask(client, new NavTask(player, nearest.getX() + 0.5, nearest.getY(),
-                    nearest.getZ() + 0.5, true, "go_to_block"));
+                    nearest.getZ() + 0.5, true, "go_to_block"), "go_to_block");
         } else {
             System.out.println("[MC-Control] Block not found: " + blockType + " (checked " + checked + " blocks)");
             sendResult("go_to_block", false, "未找到方块: " + blockType);

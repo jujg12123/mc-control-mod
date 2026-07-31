@@ -99,17 +99,20 @@ class MCControlPlugin extends Plugin {
         if (!this.mc || !this.mc.connected) return;
         if (!request || !request.tools) return;
 
-        // 需要屏蔽的工具名（按键/鼠标/代码执行类，会和 MC 控制打架）
+        // 需要屏蔽的工具名：与 built-in 插件真实注册名一致（按键/鼠标/代码执行类，会和 MC 控制打架）
         const blockedTools = [
-            'execute_code', 'type_text', 'mouse_click', 'mouse_move',
-            'press_key', 'screenshot', 'keyboard'
+            'execute_code', 'install_packages', 'type_text', 'click_mouse',
+            'press_arrow', 'take_screenshot', 'pc_screen_click'
         ];
 
         const before = request.tools.length;
-        request.tools = request.tools.filter(t => {
-            const name = t?.function?.name || '';
+        const filtered = request.tools.filter(t => {
+            const name = t?.function?.name || t?.name || '';
             return !blockedTools.includes(name);
         });
+        // 注意：SDK 的 runLLMRequestHooks 传入的是 allTools 数组本身，
+        // 必须原地修改（splice），重新赋值对实际 API 调用无效
+        request.tools.splice(0, request.tools.length, ...filtered);
         const removed = before - request.tools.length;
         if (removed > 0) {
             console.log(`[MC-Control] 已屏蔽 ${removed} 个冲突工具（MC 连接中）`);
@@ -279,6 +282,13 @@ class MCControlPlugin extends Plugin {
         if (!this.goal || !this.mc || !this.mc.connected) return;
         // 有 pending 动作时不触发新循环
         if (this._pendingCalls.size > 0) return;
+
+        const now = Date.now();
+        // 防卡死：AI 超过 20 秒未响应（纯文本回复、sendMessage 失败等），解锁循环允许再次触发
+        if (this.aiThinking && now - this.lastGoalTriggerTime > 20000) {
+            console.log('[MC-Control] AI 响应超时，重置 thinking 状态并继续任务');
+            this.aiThinking = false;
+        }
         if (this.aiThinking) return;
 
         // 最大空转限制：连续 10 次循环（约 60 秒）无工具调用时自动停止
@@ -288,7 +298,6 @@ class MCControlPlugin extends Plugin {
             return;
         }
 
-        const now = Date.now();
         // 距上次触发至少 6 秒，避免与上一轮 AI 响应重叠
         if (now - this.lastGoalTriggerTime < 5000) return;
         this.lastGoalTriggerTime = now;
@@ -302,9 +311,14 @@ class MCControlPlugin extends Plugin {
         }
 
         // #5: SDK 真实方法 context.sendMessage，走完整 LLM 流程
-        this.context.sendMessage(prompt).catch(e => {
-            console.error('[MC-Control] 触发 AI 失败: ' + e.message);
-        });
+        // sendMessage 的 Promise 在整个 LLM 链（含多轮工具调用）结束后 resolve，
+        // 此时复位 aiThinking，循环可立即进入下一轮；catch 兜底失败/打断场景
+        this.context.sendMessage(prompt)
+            .then(() => { this.aiThinking = false; })
+            .catch(e => {
+                console.error('[MC-Control] 触发 AI 失败: ' + e.message);
+                this.aiThinking = false;
+            });
         this.aiThinking = true;
         this.noCommandCount++;
     }
@@ -383,24 +397,37 @@ class MCControlPlugin extends Plugin {
                 action: action.action
             });
 
-            this.mc.sendAction(action);
+            // 带上 call_id：mod 回传 action_result 时原样带回，实现精确匹配
+            this.mc.sendAction({ ...action, call_id: callId });
         });
     }
 
     /**
-     * #6: 处理模组回传的 action_result，按 callId 匹配 pending 调用。
-     * 由于模组侧 action_result 不带回传 callId，按 FIFO 顺序匹配最早的 pending 调用
-     * （动作是顺序执行的，结果按顺序返回）。
+     * #6: 处理模组回传的 action_result。
+     * 新版 mod 会在结果中回传 call_id，按 call_id 精确匹配；
+     * 兼容旧版 mod（无 call_id）时退回 FIFO 顺序匹配。
      */
     _handleActionResult(result) {
         if (this._pendingCalls.size === 0) return;
-        // 取最早的 pending 调用（FIFO）
-        const firstKey = this._pendingCalls.keys().next().value;
-        const pending = this._pendingCalls.get(firstKey);
+        let key = null;
+        let pending = null;
+        if (result.call_id !== undefined) {
+            // 新版 mod：按 call_id 精确匹配；找不到说明已超时，直接丢弃避免错配
+            if (this._pendingCalls.has(result.call_id)) {
+                key = result.call_id;
+                pending = this._pendingCalls.get(key);
+            } else {
+                return;
+            }
+        } else if (this._pendingCalls.size > 0) {
+            // 旧版 mod 回传（无 call_id）：取最早的 pending 调用（FIFO）
+            key = this._pendingCalls.keys().next().value;
+            pending = this._pendingCalls.get(key);
+        }
         if (!pending) return;
 
         clearTimeout(pending.timer);
-        this._pendingCalls.delete(firstKey);
+        this._pendingCalls.delete(key);
         this.noCommandCount = 0;
 
         const success = result.success !== false;

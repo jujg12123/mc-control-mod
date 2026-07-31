@@ -11,7 +11,10 @@ import net.minecraft.entity.Entity;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.ItemStack;
+import net.minecraft.recipe.Ingredient;
 import net.minecraft.recipe.Recipe;
+import net.minecraft.recipe.ShapedRecipe;
+import net.minecraft.recipe.ShapelessRecipe;
 import net.minecraft.registry.Registries;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.util.ActionResult;
@@ -19,6 +22,7 @@ import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.EntityHitResult;
+import net.minecraft.util.collection.DefaultedList;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
@@ -63,6 +67,11 @@ public class ActionExecutor {
     private static volatile boolean actionInProgress = false;
     private static volatile boolean navCancelled = false;
     private static volatile long actionVersion = 0;
+    /** 当前动作的 call_id（由插件生成，回传结果时原样带回） */
+    private static long currentCallId = 0;
+    /** 当前长任务的来源动作名与 call_id（用于任务被打断时回传结果） */
+    private static String currentTaskActionName = "unknown";
+    private static long currentTaskCallId = 0;
 
     // 白名单：只有这些方块在导航时会被尝试破坏
     private static final Set<String> BREAKABLE_BLOCKS = Set.of(
@@ -77,6 +86,7 @@ public class ActionExecutor {
             JsonObject cmd = JsonParser.parseString(commandJson).getAsJsonObject();
             actionName = cmd.get("action").getAsString();
             String action = actionName;
+            currentCallId = cmd.has("call_id") ? cmd.get("call_id").getAsLong() : 0;
             MinecraftClient client = MinecraftClient.getInstance();
             ClientPlayerEntity player = client.player;
             if (player == null) return;
@@ -95,8 +105,15 @@ public class ActionExecutor {
 
             // --- 停止类动作：取消当前长任务 ---
             if (action.equals("stop_nav")) {
+                String stoppedAction = currentTaskActionName;
+                long stoppedCallId = currentTaskCallId;
+                boolean hadTask = currentTask != null;
                 cancelCurrentTask(client);
                 sendResult("stop_nav", true, "已停止寻路");
+                // 被停止的旧任务也要回传结果，避免插件侧一直等到超时
+                if (hadTask && stoppedCallId != 0) {
+                    sendResult(stoppedAction, stoppedCallId, false, "寻路已被停止");
+                }
                 return;
             }
 
@@ -104,9 +121,12 @@ public class ActionExecutor {
             actionVersion++;
             navCancelled = false;
             if (currentTask != null) {
+                String cancelledAction = currentTaskActionName;
+                long cancelledCallId = currentTaskCallId;
                 releaseAllKeys(client);
                 currentTask = null;
                 actionInProgress = false;
+                sendResult(cancelledAction, cancelledCallId, false, "上一个任务已被新动作打断");
             }
 
             switch (action) {
@@ -204,7 +224,7 @@ public class ActionExecutor {
                     float yaw = cmd.get("yaw").getAsFloat();
                     float pitch = cmd.get("pitch").getAsFloat();
                     // 使用平滑视角任务（模拟鼠标移动，多个 tick 渐进转向）
-                    startTask(client, new SmoothLookTask(yaw, pitch));
+                    startTask(client, new SmoothLookTask(yaw, pitch), "look_at");
                 }
                 case "sneak" -> {
                     client.options.sneakKey.setPressed(true);
@@ -269,25 +289,25 @@ public class ActionExecutor {
                     double tx = cmd.get("x").getAsDouble();
                     double ty = cmd.get("y").getAsDouble();
                     double tz = cmd.get("z").getAsDouble();
-                    startTask(client, new NavTask(player, tx, ty, tz, true));
+                    startTask(client, new NavTask(player, tx, ty, tz, true, "go_to_pos"));
                 }
 
                 // === 持续挖掘直到破坏 ===
                 case "dig_block" -> {
                     double timeout = cmd.has("timeout")
                             ? cmd.get("timeout").getAsDouble() : 10.0;
-                    startTask(client, new DigBlockTask(timeout));
+                    startTask(client, new DigBlockTask(timeout), "dig_block");
                 }
 
                 // === 向下挖掘（安全） ===
                 case "dig_down" -> {
                     int distance = cmd.has("distance")
                             ? cmd.get("distance").getAsInt() : 1;
-                    startTask(client, new DigDownTask(distance));
+                    startTask(client, new DigDownTask(distance), "dig_down");
                 }
 
                 // === 回到地面（向上挖） ===
-                case "go_to_surface" -> startTask(client, new GoToSurfaceTask());
+                case "go_to_surface" -> startTask(client, new GoToSurfaceTask(), "go_to_surface");
 
                 // === 攻击实体 ===
                 case "attack_entity" -> {
@@ -368,10 +388,12 @@ public class ActionExecutor {
     }
 
     /** 启动一个长任务（调用前 execute 已清理旧任务并 actionVersion++） */
-    private static void startTask(MinecraftClient client, ActionTask task) {
+    private static void startTask(MinecraftClient client, ActionTask task, String actionName) {
         releaseAllKeys(client);
         actionInProgress = true;
         currentTask = task;
+        currentTaskActionName = actionName;
+        currentTaskCallId = currentCallId;
     }
 
     private static void cancelCurrentTask(MinecraftClient client) {
@@ -404,6 +426,7 @@ public class ActionExecutor {
         private final float targetYaw;
         private final float targetPitch;
         private final long myVersion;
+        private final long callId = currentCallId;
         private int totalTicks = 0;
         private static final int MAX_TICKS = 100; // 5 秒超时
 
@@ -424,7 +447,7 @@ public class ActionExecutor {
                 // 超时，直接到位
                 player.setYaw(targetYaw);
                 player.setPitch(targetPitch);
-                sendResult("look_at", true, "视角已调整 (超时强制到位)");
+                sendResult("look_at", callId, true, "视角已调整 (超时强制到位)");
                 return true;
             }
 
@@ -439,7 +462,7 @@ public class ActionExecutor {
             if (Math.abs(yawDelta) < 1.0f && Math.abs(pitchDelta) < 1.0f) {
                 player.setYaw(targetYaw);
                 player.setPitch(targetPitch);
-                sendResult("look_at", true,
+                sendResult("look_at", callId, true,
                     String.format("视角已调整 (yaw=%.1f, pitch=%.1f, %d ticks)",
                         targetYaw, targetPitch, totalTicks));
                 return true;
@@ -503,20 +526,30 @@ public class ActionExecutor {
         private final double tx, ty, tz;
         private final boolean emitResult;
         private final long myVersion;
-        private double lastX, lastZ;
-        private int stuckTicks = 0;
+        private final long callId;
+        private final String resultAction;
+        private final long startTime;
+        private double lastCheckX, lastCheckZ;   // 卡住检测窗口起点（每 0.5s 结算）
+        private int checkCounter = 0;
+        private int stuckCount = 0;              // 连续无进展的窗口数
+        private int jumpTicks = 0;               // 跳跃按键保持 tick 数
         private int totalTicks = 0;
-        private final int maxTicks = 600; // 约 30 秒（20 TPS）
-        private int strafeDir = 0;        // BYPASS 方向
+        private final int maxTicks = 600;        // 约 30 秒（20 TPS）
+        private int strafeDir = 0;
         private int state = NAV;
         private int stateTicks = 0;
+        private BlockPos targetObstacle = null;  // BREAKING 正在挖掘的方块
+        private double bypassStartX = 0, bypassStartZ = 0;
 
-        NavTask(ClientPlayerEntity player, double tx, double ty, double tz, boolean emitResult) {
+        NavTask(ClientPlayerEntity player, double tx, double ty, double tz, boolean emitResult, String resultAction) {
             this.tx = tx; this.ty = ty; this.tz = tz;
             this.emitResult = emitResult;
+            this.resultAction = resultAction;
+            this.callId = currentCallId;
             this.myVersion = actionVersion;
-            this.lastX = player.getX();
-            this.lastZ = player.getZ();
+            this.startTime = System.currentTimeMillis();
+            this.lastCheckX = player.getX();
+            this.lastCheckZ = player.getZ();
         }
 
         @Override
@@ -525,7 +558,6 @@ public class ActionExecutor {
             if (actionVersion != myVersion || navCancelled) {
                 return true;
             }
-
             // ---- 子状态：挖掘障碍 ----
             if (state == BREAKING) {
                 return tickBreaking(client, player);
@@ -546,88 +578,152 @@ public class ActionExecutor {
             double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
             if (dist < 1.5) {
-                if (emitResult) sendResult("go_to_pos", true, "已到达目标位置");
+                if (emitResult) sendResult(resultAction, callId, true, "已到达目标位置");
                 return true;
             }
-            if (totalTicks >= maxTicks) {
-                if (emitResult) sendResult("go_to_pos", false, "导航超时");
+            if (totalTicks >= maxTicks || System.currentTimeMillis() - startTime > 32000) {
+                if (emitResult) sendResult(resultAction, callId, false, "导航超时");
                 return true;
             }
 
             double yaw = Math.toDegrees(Math.atan2(-dx, dz));
             double pitch = Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
 
-            // 卡住检测
-            double moved = Math.abs(player.getX() - lastX) + Math.abs(player.getZ() - lastZ);
-            if (moved < 0.05) {
-                stuckTicks++;
-                if (stuckTicks == 5) {
-                    // 先检查头顶是否被挡住：如果是，挖掉头顶方块而非跳跃
+            // 跳跃按键计时（保持 4 tick 让跳跃真正生效，避免“抽搐”式单 tick 点按）
+            if (jumpTicks > 0) {
+                jumpTicks--;
+                client.options.jumpKey.setPressed(true);
+            } else {
+                client.options.jumpKey.setPressed(false);
+            }
+
+            // ---- 卡住检测：每 10 tick（0.5s）结算一次位移，避免逐 tick 抖动误判 ----
+            checkCounter++;
+            if (checkCounter >= 10) {
+                double moved = Math.abs(player.getX() - lastCheckX)
+                        + Math.abs(player.getZ() - lastCheckZ);
+                boolean tryingToMove = client.options.forwardKey.isPressed()
+                        || client.options.backKey.isPressed()
+                        || client.options.leftKey.isPressed()
+                        || client.options.rightKey.isPressed();
+                if (tryingToMove && moved < 0.15) {
+                    stuckCount++;
+                } else {
+                    stuckCount = 0;
+                }
+                lastCheckX = player.getX();
+                lastCheckZ = player.getZ();
+                checkCounter = 0;
+
+                if (stuckCount >= 2) {
+                    // 卡住 ≥1 秒：优先尝试挖掘正前方的阻挡方块
+                    BlockPos obstacle = findBlockInFront(player);
+                    if (obstacle != null) {
+                        if (isBreakable(player, obstacle)) {
+                            startDigging(client, player, obstacle);
+                            return false;
+                        }
+                        // 不可破坏（基岩等）：绕行
+                        startBypass(client, player);
+                        return false;
+                    }
+                    // 前方没有方块但头顶被挡住：挖头顶
                     BlockPos headBlock = player.getBlockPos().up();
                     if (!player.getWorld().getBlockState(headBlock).isAir()) {
-                        // 头顶有方块，进入挖掘状态
-                        state = BREAKING;
-                        stateTicks = 0;
-                        client.options.forwardKey.setPressed(false);
-                        player.setPitch(-90f); // 抬头看头顶
-                        client.options.attackKey.setPressed(true);
+                        startDigging(client, player, headBlock);
                         return false;
                     }
-                    // 头顶没方块，跳一下
+                    // 都不是：跳一下试试脱困
                     applyMove(client, player, yaw, pitch, true, 0);
-                } else if (stuckTicks == 15) {
-                    strafeDir = (strafeDir == 0) ? 1 : (strafeDir == 1 ? -1 : 1);
-                    applyMove(client, player, yaw, pitch, true, strafeDir);
-                } else if (stuckTicks >= 30) {
-                    // 尝试挖障碍
-                    BlockPos obstacle = findObstacleInFront(player, tx, ty, tz);
-                    if (obstacle != null && isBreakable(player, obstacle)) {
-                        state = BREAKING;
-                        stateTicks = 0;
-                        client.options.forwardKey.setPressed(false);
-                        client.options.attackKey.setPressed(true);
-                        return false;
-                    }
-                    // 不可破坏，绕行
-                    strafeDir = (strafeDir == 0) ? 1 : (strafeDir == 1 ? -1 : 1);
-                    state = BYPASS;
-                    stateTicks = 0;
-                    return false;
+                } else if (stuckCount == 1) {
+                    // 卡住 0.5s：先跳一下（可能卡在台阶/栅栏上）
+                    applyMove(client, player, yaw, pitch, true, 0);
                 } else {
                     applyMove(client, player, yaw, pitch, false, 0);
                 }
             } else {
-                stuckTicks = 0;
-                strafeDir = 0;
                 applyMove(client, player, yaw, pitch, false, 0);
             }
-            lastX = player.getX();
-            lastZ = player.getZ();
             return false;
         }
 
+        /** 挖掘障碍子状态：锁定瞄准目标方块并持续挖掘，直到方块被破坏 */
         private boolean tickBreaking(MinecraftClient client, ClientPlayerEntity player) {
             stateTicks++;
-            // 检查前方障碍是否已破坏
-            HitResult hit = player.raycast(4.0, 0, false);
-            boolean cleared = true;
-            if (hit.getType() == HitResult.Type.BLOCK) {
-                BlockPos ob = ((BlockHitResult) hit).getBlockPos();
-                if (!player.getWorld().getBlockState(ob).isAir()) {
-                    cleared = false;
+            if (targetObstacle == null) {
+                // 兜底：用视线射线寻找目标
+                BlockPos fallback = findObstacleInFront(player, tx, ty, tz);
+                if (fallback != null) {
+                    targetObstacle = fallback;
+                } else {
+                    endBreaking(client, player);
+                    return false;
                 }
             }
-            if (cleared || stateTicks > 40) { // 最多 2 秒
-                client.options.attackKey.setPressed(false);
-                stuckTicks = 0;
-                state = NAV;
+
+            // 持续瞄准方块中心（玩家位置可能滑动），保证挖掘命中、视角稳定
+            double dx = targetObstacle.getX() + 0.5 - player.getX();
+            double dy = targetObstacle.getY() + 0.5
+                    - (player.getY() + player.getEyeHeight(player.getPose()));
+            double dz = targetObstacle.getZ() + 0.5 - player.getZ();
+            player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+            player.setPitch((float) Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz))));
+            client.options.attackKey.setPressed(true);
+
+            // 目标已被破坏
+            if (player.getWorld().getBlockState(targetObstacle).isAir()) {
+                endBreaking(client, player);
+                StateCollector.addBehaviorLog("寻路障碍已清除");
+                return false;
+            }
+            // 超过 4 秒仍未破坏（基岩/黑曜石等不可挖掘方块）：放弃挖掘改绕行
+            if (stateTicks > 80) {
+                endBreaking(client, player);
+                strafeDir = (strafeDir == 0) ? 1 : (strafeDir == 1 ? -1 : 1);
+                state = BYPASS;
+                stateTicks = 0;
+                bypassStartX = player.getX();
+                bypassStartZ = player.getZ();
+                StateCollector.addBehaviorLog("障碍无法挖掘，尝试绕行");
             }
             return false;
         }
 
+        /** 结束挖掘：释放按键，重置卡住计数，回到正常导航 */
+        private void endBreaking(MinecraftClient client, ClientPlayerEntity player) {
+            client.options.attackKey.setPressed(false);
+            client.options.forwardKey.setPressed(false);
+            client.options.jumpKey.setPressed(false);
+            targetObstacle = null;
+            stuckCount = 0;
+            lastCheckX = player.getX();
+            lastCheckZ = player.getZ();
+            checkCounter = 0;
+            state = NAV;
+        }
+
+        /** 开始挖掘指定方块：锁定视角、按住攻击键；方块较远时同时前进 */
+        private void startDigging(MinecraftClient client, ClientPlayerEntity player, BlockPos obstacle) {
+            state = BREAKING;
+            stateTicks = 0;
+            targetObstacle = obstacle;
+            client.options.jumpKey.setPressed(false);
+            client.options.attackKey.setPressed(true);
+            double dx = obstacle.getX() + 0.5 - player.getX();
+            double dy = obstacle.getY() + 0.5
+                    - (player.getY() + player.getEyeHeight(player.getPose()));
+            double dz = obstacle.getZ() + 0.5 - player.getZ();
+            double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+            player.setPitch((float) Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz))));
+            // 方块在 1.6 格外时边挖边前进（如视线前方 2-4 格的墙）
+            client.options.forwardKey.setPressed(dist > 1.6);
+            StateCollector.addBehaviorLog("寻路中挖掘障碍 " + obstacle.toShortString());
+        }
+
+        /** 绕行子状态：朝目标方向前进并侧移，有进展后回到正常导航 */
         private boolean tickBypass(MinecraftClient client, ClientPlayerEntity player) {
             stateTicks++;
-            // 朝目标方向但侧移绕行
             double dx = tx - player.getX();
             double dz = tz - player.getZ();
             double yaw = Math.toDegrees(Math.atan2(-dx, dz));
@@ -640,13 +736,70 @@ public class ActionExecutor {
                 client.options.rightKey.setPressed(true);
                 client.options.leftKey.setPressed(false);
             }
-            if (stateTicks > 30) { // 1.5 秒后恢复导航
-                client.options.leftKey.setPressed(false);
-                client.options.rightKey.setPressed(false);
-                stuckTicks = 20;
-                state = NAV;
+
+            // 每 1.5 秒评估：若已开始朝目标靠近，则结束绕行
+            if (stateTicks % 30 == 0) {
+                double moved = Math.abs(player.getX() - bypassStartX)
+                        + Math.abs(player.getZ() - bypassStartZ);
+                if (moved > 0.5) {
+                    endBypass(client);
+                    stuckCount = 0;
+                    lastCheckX = player.getX();
+                    lastCheckZ = player.getZ();
+                    checkCounter = 0;
+                    state = NAV;
+                    return false;
+                }
+            }
+            // 绕行 4.5 秒无进展：若前方可挖则硬挖，否则回到导航强制进入挖掘评估
+            if (stateTicks > 90) {
+                endBypass(client);
+                BlockPos obstacle = findBlockInFront(player);
+                if (obstacle != null && isBreakable(player, obstacle)) {
+                    startDigging(client, player, obstacle);
+                } else {
+                    stuckCount = 3; // 下一窗口立即进入挖掘评估
+                    lastCheckX = player.getX();
+                    lastCheckZ = player.getZ();
+                    checkCounter = 0;
+                    state = NAV;
+                }
             }
             return false;
+        }
+
+        private void endBypass(MinecraftClient client) {
+            client.options.leftKey.setPressed(false);
+            client.options.rightKey.setPressed(false);
+            client.options.forwardKey.setPressed(false);
+        }
+
+        private void startBypass(MinecraftClient client, ClientPlayerEntity player) {
+            strafeDir = (strafeDir == 0) ? 1 : (strafeDir == 1 ? -1 : 1);
+            bypassStartX = player.getX();
+            bypassStartZ = player.getZ();
+            state = BYPASS;
+            stateTicks = 0;
+            client.options.attackKey.setPressed(false);
+            client.options.jumpKey.setPressed(false);
+            StateCollector.addBehaviorLog("寻路中尝试绕行");
+        }
+
+        /** 查找玩家正前方（行进方向）的阻挡方块：先查相邻脚部/身体高度，其次视线射线 */
+        private BlockPos findBlockInFront(ClientPlayerEntity player) {
+            World world = player.getWorld();
+            BlockPos pos = player.getBlockPos();
+            double rad = Math.toRadians(player.getYaw());
+            int dx = (int) Math.round(-Math.sin(rad));
+            int dz = (int) Math.round(Math.cos(rad));
+            for (int dy = 0; dy <= 1; dy++) {
+                BlockPos front = new BlockPos(pos.getX() + dx, pos.getY() + dy, pos.getZ() + dz);
+                if (!world.getBlockState(front).isAir()) {
+                    return front;
+                }
+            }
+            // 相邻一格没有方块：用视线射线找更远处的墙
+            return findObstacleInFront(player, tx, ty, tz);
         }
 
         private void applyMove(MinecraftClient client, ClientPlayerEntity player,
@@ -654,7 +807,7 @@ public class ActionExecutor {
             player.setYaw((float) yaw);
             player.setPitch((float) pitch);
             client.options.forwardKey.setPressed(true);
-            client.options.jumpKey.setPressed(jump);
+            if (jump) jumpTicks = 4;
             if (sDir > 0) {
                 client.options.leftKey.setPressed(true);
                 client.options.rightKey.setPressed(false);
@@ -667,7 +820,6 @@ public class ActionExecutor {
             }
         }
     }
-
     /** 在主线程同步查找前方障碍方块（排除目标本身） */
     private static BlockPos findObstacleInFront(ClientPlayerEntity player,
                                                 double tx, double ty, double tz) {
@@ -698,6 +850,7 @@ public class ActionExecutor {
         private final long myVersion;
         private final long timeoutMs;
         private final long startTime;
+        private final long callId = currentCallId;
         private BlockPos targetPos;
         private BlockState targetBlockState;  // 记录初始方块状态，用于校验是否挖对了
         private String targetBlockName;       // 目标方块名称（用于结果报告）
@@ -719,13 +872,13 @@ public class ActionExecutor {
             if (!initialized) {
                 HitResult hit = player.raycast(5.0, 0, false);
                 if (hit.getType() != HitResult.Type.BLOCK) {
-                    sendResult("dig_block", false, "视线内没有方块");
+                    sendResult("dig_block", callId, false, "视线内没有方块");
                     return true;
                 }
                 targetPos = ((BlockHitResult) hit).getBlockPos();
                 BlockState s = player.getWorld().getBlockState(targetPos);
                 if (s.isAir()) {
-                    sendResult("dig_block", false, "目标方块是空气");
+                    sendResult("dig_block", callId, false, "目标方块是空气");
                     return true;
                 }
                 targetBlockState = s;
@@ -749,7 +902,7 @@ public class ActionExecutor {
                                     client.execute(() -> client.options.forwardKey.setPressed(false)),
                                     500, TimeUnit.MILLISECONDS);
                         }), 300, TimeUnit.MILLISECONDS);
-                sendResult("dig_block", true, "已破坏 " + targetBlockName);
+                sendResult("dig_block", callId, true, "已破坏 " + targetBlockName);
                 return true;
             }
 
@@ -758,7 +911,7 @@ public class ActionExecutor {
             if (currentState.getBlock() != targetBlockState.getBlock()) {
                 client.options.attackKey.setPressed(false);
                 String actualName = currentState.getBlock().getName().getString();
-                sendResult("dig_block", false,
+                sendResult("dig_block", callId, false,
                     "目标方块类型已改变: 原目标=" + targetBlockName + ", 当前=" + actualName
                     + "。可能挖错了方块，请重新瞄准。");
                 return true;
@@ -766,7 +919,7 @@ public class ActionExecutor {
 
             if (System.currentTimeMillis() - startTime > timeoutMs) {
                 client.options.attackKey.setPressed(false);
-                sendResult("dig_block", false, "挖掘超时");
+                sendResult("dig_block", callId, false, "挖掘超时");
                 return true;
             }
             return false;
@@ -778,6 +931,7 @@ public class ActionExecutor {
     private static class DigDownTask implements ActionTask {
         private final int distance;
         private final long myVersion;
+        private final long callId = currentCallId;
         private int current = 0;     // 已完成的格数
         private int phase = 0;       // 0=检查并开始挖, 1=等待挖完, 2=潜行下移
         private int phaseTicks = 0;
@@ -797,7 +951,7 @@ public class ActionExecutor {
                 return true;
             }
             if (current >= distance) {
-                sendResult("dig_down", true, "已向下挖掘 " + distance + " 格");
+                sendResult("dig_down", callId, true, "已向下挖掘 " + distance + " 格");
                 return true;
             }
 
@@ -808,7 +962,7 @@ public class ActionExecutor {
                     BlockState state = player.getWorld().getBlockState(digPos);
                     String name = state.getBlock().getName().getString().toLowerCase();
                     if (name.contains("lava") || name.contains("water")) {
-                        sendResult("dig_down", false, "遇到危险: " + name);
+                        sendResult("dig_down", callId, false, "遇到危险: " + name);
                         return true;
                     }
                     // 向下看并按住挖掘键
@@ -829,7 +983,7 @@ public class ActionExecutor {
                         phase = 2;
                     } else if (phaseTicks > 100) { // 5 秒超时
                         client.options.attackKey.setPressed(false);
-                        sendResult("dig_down", false, "挖掘超时");
+                        sendResult("dig_down", callId, false, "挖掘超时");
                         return true;
                     }
                     return false;
@@ -853,6 +1007,7 @@ public class ActionExecutor {
 
     private static class GoToSurfaceTask implements ActionTask {
         private final long myVersion;
+        private final long callId = currentCallId;
         private int phaseTicks = 0;
 
         GoToSurfaceTask() {
@@ -866,7 +1021,7 @@ public class ActionExecutor {
             BlockPos pos = player.getBlockPos();
             // 已露天（头顶连续 air）则完成
             if (isOpenSky(player, pos)) {
-                sendResult("go_to_surface", true, "已回到地面");
+                sendResult("go_to_surface", callId, true, "已回到地面");
                 return true;
             }
 
@@ -931,15 +1086,24 @@ public class ActionExecutor {
         private final BlockPos tablePos;     // null = 背包合成, 非null = 工作台合成
         private final int beforeCount;       // 合成前背包中该物品的数量
         private final String outputId;       // 产物物品 ID（短名）
+        private final long callId = currentCallId;
 
         // 状态机阶段
-        // 0=打开界面, 1=等待界面打开, 2=填充网格, 3=等待填充完成,
-        // 4=确保光标空闲, 5=取出产物, 6=等待取出完成,
+        // 0=打开界面, 1=等待界面打开, 2=填充网格, 21=手动摆放材料,
+        // 3=等待填充完成, 4=确保光标空闲, 5=取出产物, 6=等待取出完成,
         // 7=检查是否需要继续合成(循环), 8=关闭并报告
         private int phase = 0;
         private int phaseTicks = 0;
         private int craftsDone = 0;           // 已完成的合成次数
         private int slotCooldown = 0;         // 槽位操作冷却（tick）
+
+        // 手动填充模式：clickRecipe 依赖配方书解锁，服务端对未解锁配方静默忽略。
+        // 检测到无产物时回退为逐格 clickSlot 手动摆放，任何配方都可靠。
+        private boolean manualMode = false;
+        private final List<Integer> manualCells = new ArrayList<>();          // 网格槽位（屏幕坐标）
+        private final List<Ingredient> manualIngredients = new ArrayList<>(); // 对应材料
+        private int fillStep = 0;          // 手动填充进度
+        private int pendingGridSlot = -1;  // 光标已拿起材料，等待放入的网格槽位
 
         CraftTask(RecipeLookup.RecipeInfo recipe, int count, BlockPos tablePos,
                   int beforeCount, String outputId) {
@@ -998,19 +1162,27 @@ public class ActionExecutor {
                         phase = 2;
                         phaseTicks = 0;
                     } else if (phaseTicks > 20) { // 1 秒超时
-                        sendResult("craft", false, "无法打开工作台界面，可能距离太远");
+                        sendResult("craft", callId, false, "无法打开工作台界面，可能距离太远");
                         return true;
                     }
                     return false;
                 }
-                case 2: { // clickRecipe 填充合成网格（单次合成，不消耗全部材料）
+                case 2: { // 填充合成网格（clickRecipe 或手动摆放）
+                    if (manualMode) {
+                        phase = 21;
+                        phaseTicks = 0;
+                        fillStep = 0;
+                        pendingGridSlot = -1;
+                        slotCooldown = 1;
+                        return false;
+                    }
                     try {
                         int syncId = player.currentScreenHandler.syncId;
                         // craftAll=false: 只合成一次，不把所有材料都消耗掉
                         client.interactionManager.clickRecipe(syncId, recipe.recipe, false);
                     } catch (Exception e) {
                         player.closeHandledScreen();
-                        sendResult("craft", false, "填充合成网格失败: " + e.getMessage());
+                        sendResult("craft", callId, false, "填充合成网格失败: " + e.getMessage());
                         return true;
                     }
                     phase = 3;
@@ -1018,19 +1190,81 @@ public class ActionExecutor {
                     slotCooldown = 3; // 等待服务端处理
                     return false;
                 }
+                case 21: { // 手动摆放材料（每个 tick 最多一次点击，避免服务端丢包）
+                    if (manualCells.isEmpty()) {
+                        if (!initManualPlacements()) {
+                            player.closeHandledScreen();
+                            sendResult("craft", callId, false, "该配方无法自动摆放，请手动合成");
+                            return true;
+                        }
+                    }
+                    // 第二步：把光标中的材料放入网格
+                    if (pendingGridSlot >= 0) {
+                        client.interactionManager.clickSlot(
+                                player.currentScreenHandler.syncId, pendingGridSlot, 0,
+                                SlotActionType.PICKUP, player);
+                        pendingGridSlot = -1;
+                        fillStep++;
+                        slotCooldown = 1;
+                        return false;
+                    }
+                    // 全部摆放完成，等待服务端生成产物
+                    if (fillStep >= manualCells.size()) {
+                        phase = 3;
+                        phaseTicks = 0;
+                        slotCooldown = 3;
+                        return false;
+                    }
+                    int gridSlot = manualCells.get(fillStep);
+                    Ingredient ing = manualIngredients.get(fillStep);
+                    // 该格已有匹配材料（上一轮残留），跳过
+                    ItemStack gridStack = player.currentScreenHandler.getSlot(gridSlot).getStack();
+                    if (!gridStack.isEmpty() && ing.test(gridStack)) {
+                        fillStep++;
+                        return false;
+                    }
+                    int invStart = (tablePos != null) ? 10 : 9;
+                    int invEnd = (tablePos != null) ? 46 : 45;
+                    for (int i = invStart; i < invEnd; i++) {
+                        ItemStack s = player.currentScreenHandler.getSlot(i).getStack();
+                        if (!s.isEmpty() && ing.test(s)) {
+                            // 第一步：从背包拿起材料
+                            client.interactionManager.clickSlot(
+                                    player.currentScreenHandler.syncId, i, 0,
+                                    SlotActionType.PICKUP, player);
+                            pendingGridSlot = gridSlot;
+                            slotCooldown = 1;
+                            return false;
+                        }
+                    }
+                    // 材料不足（可能已被前几轮消耗）
+                    player.closeHandledScreen();
+                    sendResult("craft", callId, false, "合成材料不足: " + ing.toJson());
+                    return true;
+                }
                 case 3: { // 等待网格填充完成
                     phaseTicks++;
-                    if (phaseTicks > 3) {
+                    int waitTicks = manualMode ? 6 : 3; // 手动摆放时给服务端更多同步时间
+                    if (phaseTicks > waitTicks) {
                         // 检查产物槽是否有物品
                         try {
                             ItemStack output = player.currentScreenHandler.getSlot(0).getStack();
                             if (output.isEmpty()) {
+                                // clickRecipe 无产物：常见原因是配方书未解锁（服务端静默忽略），
+                                // 回退为逐格手动摆放
+                                if (!manualMode && isManuallyPlaceable()) {
+                                    manualMode = true;
+                                    phase = 2;
+                                    phaseTicks = 0;
+                                    slotCooldown = 2;
+                                    return false;
+                                }
                                 player.closeHandledScreen();
                                 if (craftsDone > 0) {
                                     reportCraftResult(player, true);
                                     return true;
                                 }
-                                sendResult("craft", false,
+                                sendResult("craft", callId, false,
                                     "合成失败: 配方与当前合成台不匹配，或材料已被消耗");
                                 return true;
                             }
@@ -1140,6 +1374,48 @@ public class ActionExecutor {
             return false;
         }
 
+        /** 该配方是否支持手动摆放（有序/无序合成） */
+        private boolean isManuallyPlaceable() {
+            return recipe.recipe instanceof ShapedRecipe || recipe.recipe instanceof ShapelessRecipe;
+        }
+
+        /**
+         * 计算手动摆放方案：网格槽位（屏幕坐标，工作台 1-9 / 背包 1-4）+ 对应材料。
+         * 有序合成按 pattern 逐格映射，无序合成按顺序填入空格。
+         */
+        private boolean initManualPlacements() {
+            manualCells.clear();
+            manualIngredients.clear();
+            DefaultedList<Ingredient> ings = recipe.recipe.getIngredients();
+            int gridW = (tablePos != null) ? 3 : 2;
+            if (recipe.recipe instanceof ShapedRecipe shaped) {
+                List<String> pattern = shaped.getPattern();
+                for (int row = 0; row < pattern.size(); row++) {
+                    String line = pattern.get(row);
+                    for (int col = 0; col < line.length(); col++) {
+                        if (line.charAt(col) == ' ') continue;
+                        int idx = row * shaped.getWidth() + col;
+                        if (idx >= ings.size() || ings.get(idx).isEmpty()) continue;
+                        manualCells.add(row * gridW + col + 1);
+                        manualIngredients.add(ings.get(idx));
+                    }
+                }
+            } else if (recipe.recipe instanceof ShapelessRecipe) {
+                int cell = 1;
+                int maxCells = gridW * gridW;
+                for (Ingredient ing : ings) {
+                    if (ing.isEmpty()) continue;
+                    if (cell > maxCells) break;
+                    manualCells.add(cell);
+                    manualIngredients.add(ing);
+                    cell++;
+                }
+            } else {
+                return false;
+            }
+            return !manualCells.isEmpty();
+        }
+
         private void reportCraftResult(ClientPlayerEntity player, boolean success) {
             PlayerInventory inv = player.getInventory();
             int afterCount = countItemByIngredient(inv, Set.of(outputId));
@@ -1152,12 +1428,12 @@ public class ActionExecutor {
                     msg += " (请求 " + count + " 次, 实际合成 "
                             + (crafted / Math.max(1, recipe.outputCount)) + " 次, 材料不足)";
                 }
-                sendResult("craft", true, msg);
+                sendResult("craft", callId, true, msg);
             } else if (success) {
-                sendResult("craft", true,
+                sendResult("craft", callId, true,
                     "合成完成但未检测到新增物品 (可能背包已有该物品)");
             } else {
-                sendResult("craft", false,
+                sendResult("craft", callId, false,
                     "合成可能失败: 未检测到新增物品。请检查材料是否足够或配方是否正确。");
             }
         }
@@ -1166,12 +1442,17 @@ public class ActionExecutor {
     // ======================== 动作结果回传 ========================
 
     private static void sendResult(String action, boolean success, String message) {
+        sendResult(action, currentCallId, success, message);
+    }
+
+    private static void sendResult(String action, long callId, boolean success, String message) {
         try {
             ControlServer server = MCControlMod.getServer();
             if (server != null) {
                 JsonObject result = new JsonObject();
                 result.addProperty("type", "action_result");
                 result.addProperty("action", action);
+                if (callId != 0) result.addProperty("call_id", callId);
                 result.addProperty("success", success);
                 result.addProperty("message", message);
                 result.addProperty("timestamp", System.currentTimeMillis());
@@ -1229,7 +1510,7 @@ public class ActionExecutor {
             // 不立即发送结果——让 NavTask 完成后发送到达/超时结果
             // emitResult=true 使 NavTask 在到达或超时时调用 sendResult
             startTask(client, new NavTask(player, nearest.getX() + 0.5, nearest.getY(),
-                    nearest.getZ() + 0.5, true));
+                    nearest.getZ() + 0.5, true, "go_to_block"));
         } else {
             System.out.println("[MC-Control] Block not found: " + blockType + " (checked " + checked + " blocks)");
             sendResult("go_to_block", false, "未找到方块: " + blockType);
@@ -1444,7 +1725,7 @@ public class ActionExecutor {
         }
 
         // 启动合成任务（tick 状态机，确保服务端同步）
-        startTask(client, new CraftTask(selected, count, tablePos, beforeCount, outputId));
+        startTask(client, new CraftTask(selected, count, tablePos, beforeCount, outputId), "craft");
     }
 
     /** 查询物品的合成配方，返回配方详情供 AI 参考 */

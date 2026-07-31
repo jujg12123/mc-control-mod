@@ -25,7 +25,7 @@ import java.util.Map;
 
 public class StateCollector {
 
-    private static String lastStateHash = null;
+    private static Integer lastStateHash = null;
     private static JsonArray behaviorLog = new JsonArray();
 
     /**
@@ -239,10 +239,10 @@ public class StateCollector {
         hashCopy.remove("time");
         String hashStr = hashCopy.toString();
         int hash = hashStr.hashCode();
-        if (lastStateHash != null && hash == Integer.parseInt(lastStateHash)) {
+        if (lastStateHash != null && hash == lastStateHash) {
             return null; // 状态未变化
         }
-        lastStateHash = String.valueOf(hash);
+        lastStateHash = hash;
         return state.toString();
     }
 

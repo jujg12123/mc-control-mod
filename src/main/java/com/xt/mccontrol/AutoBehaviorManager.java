@@ -45,6 +45,10 @@ public class AutoBehaviorManager {
     private static final long EAT_COOLDOWN_MS = 5000;
     private static long useKeyPressedTime = 0; // 使用键按下时间，用于延迟释放
 
+    // 逃生状态（任务中保命逃跑的按键自动释放）
+    private static long escapeActiveUntil = 0;
+    private static long fleeActiveUntil = 0; // 普通模式下自动逃离的按键释放时间
+
     // 拾取状态
     private static long lastPickupAttempt = 0;
     private static final long PICKUP_COOLDOWN_MS = 2000;
@@ -66,6 +70,15 @@ public class AutoBehaviorManager {
         long now = System.currentTimeMillis();
 
         // 统一检查需要释放的按键（在节流之前，确保及时释放）
+        if (escapeActiveUntil > 0 && now > escapeActiveUntil) {
+            client.options.forwardKey.setPressed(false);
+            client.options.jumpKey.setPressed(false);
+            escapeActiveUntil = 0;
+        }
+        if (fleeActiveUntil > 0 && now > fleeActiveUntil) {
+            client.options.forwardKey.setPressed(false);
+            fleeActiveUntil = 0;
+        }
         if (attackKeyPressedTime > 0 && now - attackKeyPressedTime > 200) {
             client.options.attackKey.setPressed(false);
             attackKeyPressedTime = 0;
@@ -125,13 +138,14 @@ public class AutoBehaviorManager {
         if (nearest == null) return;
         if (Math.sqrt(nearestDist) >= 8.0) return;
 
-        // 朝远离实体的方向跑
+        // 朝远离实体的方向跑（3 秒后自动释放按键，避免威胁消失后按键泄漏）
         double dx = player.getX() - nearest.getX();
         double dz = player.getZ() - nearest.getZ();
         float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
         player.setYaw(yaw);
         client.options.forwardKey.setPressed(true);
         client.options.jumpKey.setPressed(true);
+        escapeActiveUntil = now + 3000;
         StateCollector.addBehaviorLog("任务中遇险自动逃离 " + nearest.getName().getString());
     }
 
@@ -184,12 +198,13 @@ public class AutoBehaviorManager {
             lastAttackTime = now;
             StateCollector.addBehaviorLog("自动攻击了 " + nearest.getName().getString());
         } else if (dist < 8.0 && player.getHealth() < 10.0f) {
-            // 逃跑：朝远离实体的方向移动
+            // 逃跑：朝远离实体的方向移动（2 秒后自动释放按键，避免威胁消失后一直跑）
             double dx = player.getX() - nearest.getX();
             double dz = player.getZ() - nearest.getZ();
             float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
             player.setYaw(yaw);
             client.options.forwardKey.setPressed(true);
+            fleeActiveUntil = now + 2000;
             StateCollector.addBehaviorLog("自动逃离 " + nearest.getName().getString());
         }
     }

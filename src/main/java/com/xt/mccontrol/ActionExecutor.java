@@ -1389,12 +1389,12 @@ public class ActionExecutor {
             DefaultedList<Ingredient> ings = recipe.recipe.getIngredients();
             int gridW = (tablePos != null) ? 3 : 2;
             if (recipe.recipe instanceof ShapedRecipe shaped) {
-                List<String> pattern = shaped.getPattern(null);
-                for (int row = 0; row < pattern.size(); row++) {
-                    String line = pattern.get(row);
-                    for (int col = 0; col < line.length(); col++) {
-                        if (line.charAt(col) == ' ') continue;
-                        int idx = row * shaped.getWidth() + col;
+                // 1.20.1: getPattern is not public, use width/height + ingredients
+                int w = shaped.getWidth();
+                int h = shaped.getHeight();
+                for (int row = 0; row < h; row++) {
+                    for (int col = 0; col < w; col++) {
+                        int idx = row * w + col;
                         if (idx >= ings.size() || ings.get(idx).isEmpty()) continue;
                         manualCells.add(row * gridW + col + 1);
                         manualIngredients.add(ings.get(idx));

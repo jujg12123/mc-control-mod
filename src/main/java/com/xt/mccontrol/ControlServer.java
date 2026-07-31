@@ -8,7 +8,9 @@ import org.java_websocket.server.WebSocketServer;
 import java.net.InetSocketAddress;
 
 public class ControlServer extends WebSocketServer {
-    private WebSocket currentConnection = null;
+    // 支持多连接：插件重连或误开多个实例时，状态/结果广播给所有存活连接，
+    // 避免只记录最后一个连接导致其他连接收不到状态（表现为"已连接但未收到状态"）
+    private final java.util.Set<WebSocket> connections = new java.util.concurrent.CopyOnWriteArraySet<>();
 
     public ControlServer() {
         super(new InetSocketAddress("localhost", 8765));
@@ -17,14 +19,14 @@ public class ControlServer extends WebSocketServer {
 
     @Override
     public void onOpen(WebSocket conn, ClientHandshake handshake) {
-        currentConnection = conn;
-        System.out.println("[MC-Control] AI 大脑已连接");
+        connections.add(conn);
+        System.out.println("[MC-Control] AI 大脑已连接 (当前连接数: " + connections.size() + ")");
     }
 
     @Override
     public void onClose(WebSocket conn, int code, String reason, boolean remote) {
-        currentConnection = null;
-        System.out.println("[MC-Control] AI 大脑已断开");
+        connections.remove(conn);
+        System.out.println("[MC-Control] AI 大脑已断开 (剩余连接数: " + connections.size() + ")");
     }
 
     @Override
@@ -40,12 +42,14 @@ public class ControlServer extends WebSocketServer {
 
     @Override
     public void onStart() {
-        System.out.println("[MC-Control] WebSocket server started");
+        System.out.println("[MC-Control] WebSocket server started (ws://localhost:8765)");
     }
 
     public void sendState(String stateJson) {
-        if (currentConnection != null && currentConnection.isOpen()) {
-            currentConnection.send(stateJson);
+        for (WebSocket conn : connections) {
+            if (conn.isOpen()) {
+                conn.send(stateJson);
+            }
         }
     }
 
@@ -53,8 +57,14 @@ public class ControlServer extends WebSocketServer {
      * 发送动作执行结果给 AI 插件
      */
     public void sendActionResult(String resultJson) {
-        if (currentConnection != null && currentConnection.isOpen()) {
-            currentConnection.send(resultJson);
+        for (WebSocket conn : connections) {
+            if (conn.isOpen()) {
+                conn.send(resultJson);
+            }
         }
+    }
+
+    public int getConnectionCount() {
+        return connections.size();
     }
 }

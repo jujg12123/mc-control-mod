@@ -27,6 +27,9 @@ class MCControlPlugin extends Plugin {
         // #6: 多 pending 调用管理
         this._callCounter = 0;
         this._pendingCalls = new Map(); // callId -> { resolve, timer, action }
+        // 诊断：是否收到过 mod 的 state 消息（区分"socket 已连接"和"真正能拿到游戏状态"）
+        this._stateReceived = false;
+        this._stateWarned = false;
     }
 
     async onStart() {
@@ -36,6 +39,14 @@ class MCControlPlugin extends Plugin {
         // 设置回调
         this.mc.onState = (state) => {
             this.latestState = state;
+            if (state) {
+                if (!this._stateReceived) {
+                    this._stateReceived = true;
+                    this.context.log('info', '已收到 Minecraft 游戏状态，连接正常');
+                }
+            } else {
+                this._stateReceived = false;
+            }
             this._refreshSystemPrompt();
         };
         this.mc.onActionResult = (result) => this._handleActionResult(result);
@@ -47,6 +58,20 @@ class MCControlPlugin extends Plugin {
         } catch (e) {
             this.context.log('error', '初始连接失败: ' + e.message + '，将自动重连...');
         }
+
+        // 诊断：连接成功后 5 秒仍未收到状态 → 说明连上了但拿不到游戏数据
+        // 常见原因：开了多个 Minecraft 实例 / 8765 端口被其他程序占用 / 游戏没进世界
+        setTimeout(() => {
+            if (!this._stateReceived && !this._stateWarned) {
+                this._stateWarned = true;
+                this.context.log('error',
+                    '已连接但 5 秒内未收到游戏状态！请检查：\n' +
+                    '1) 只开一个 Minecraft 实例；\n' +
+                    '2) 游戏已进入世界（标题画面不会发状态）；\n' +
+                    '3) 8765 端口未被其他程序占用（netstat -ano | findstr 8765）；\n' +
+                    '4) 查看游戏日志 latest.log 中 [MC-Control] 的输出。');
+            }
+        }, 5000);
 
         const autoControl = cfg.auto_control !== undefined ? cfg.auto_control : false;
         if (autoControl) {
@@ -125,7 +150,7 @@ class MCControlPlugin extends Plugin {
             { type: 'function', function: { name: 'mc_look', description: '查看 Minecraft 当前状态：位置、视线、背包、脚下', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_move', description: '控制角色移动', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['forward', 'back', 'left', 'right'], description: '移动方向' }, duration: { type: 'number', description: '移动时长（秒），默认 0.5', default: 0.5 } }, required: ['direction'] } } },
             { type: 'function', function: { name: 'mc_dig', description: '挖掘/攻击视线前方的方块，默认持续 2 秒', parameters: { type: 'object', properties: { duration: { type: 'number', description: '挖掘时长（秒），木头约 2s，石头约 3-5s', default: 2.0 } }, required: [] } } },
-            { type: 'function', function: { name: 'mc_place', description: '在视线前方放置方块。可指定物品名称自动切换到对应槽位，不指定则放置当前手持物品', parameters: { type: 'object', properties: { item_name: { type: 'string', description: '要放置的物品名称或 ID，如 crafting_table, dirt, oak_planks。不传则放置当前手持物品' } }, required: [] } } },
+            { type: 'function', function: { name: 'mc_place', description: '在视线前方放置方块。mod 会自动后退拉开距离并抬平视角再放置。可指定物品名称自动切换到对应槽位，不指定则放置当前手持物品。若失败会返回原因（距离/视角），可先 mc_turn 看向目标位置再重试', parameters: { type: 'object', properties: { item_name: { type: 'string', description: '要放置的物品名称或 ID，如 crafting_table, dirt, oak_planks。不传则放置当前手持物品' } }, required: [] } } },
             { type: 'function', function: { name: 'mc_jump', description: '跳跃', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_switch', description: '切换快捷栏物品', parameters: { type: 'object', properties: { slot: { type: 'integer', description: '槽位号 (0-8)' } }, required: ['slot'] } } },
             { type: 'function', function: { name: 'mc_turn', description: '转动视角', parameters: { type: 'object', properties: { yaw: { type: 'number', description: '水平角度（0=正南, 正值=向西转, 负值=向东转）' }, pitch: { type: 'number', description: '垂直角度（正值=向上看, 负值=向下看, 范围-90到90）' } }, required: ['yaw', 'pitch'] } } },
@@ -133,12 +158,12 @@ class MCControlPlugin extends Plugin {
             { type: 'function', function: { name: 'mc_sneak', description: '潜行（蹲下）', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_unsneak', description: '取消潜行（站起来）', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_drop', description: '丢弃当前手持物品', parameters: { type: 'object', properties: {}, required: [] } } },
-            { type: 'function', function: { name: 'mc_goToBlock', description: '自动寻路到最近的指定方块。使用英文 ID（如 oak_log, stone, coal_ore）或中文名。状态里的 [minecraft:xxx] 就是 ID', parameters: { type: 'object', properties: { block_type: { type: 'string', description: '方块类型名称，如 oak_log, stone, coal_ore' }, range: { type: 'number', description: '搜索范围（格），默认 64', default: 64 } }, required: ['block_type'] } } },
+            { type: 'function', function: { name: 'mc_goToBlock', description: '自动寻路到最近的指定方块。使用英文 ID（如 oak_log, stone, coal_ore）或中文名。状态里的 [minecraft:xxx] 就是 ID。若目标是原木/矿物（log/ore），会自动标注整棵树/整条矿脉的相连方块，之后调用 mc_digBlock 会一次挖完所有标注方块', parameters: { type: 'object', properties: { block_type: { type: 'string', description: '方块类型名称，如 oak_log, stone, coal_ore' }, range: { type: 'number', description: '搜索范围（格），默认 64', default: 64 } }, required: ['block_type'] } } },
             { type: 'function', function: { name: 'mc_goToPos', description: '自动寻路到指定坐标', parameters: { type: 'object', properties: { x: { type: 'number', description: 'X 坐标' }, y: { type: 'number', description: 'Y 坐标' }, z: { type: 'number', description: 'Z 坐标' } }, required: ['x', 'y', 'z'] } } },
             { type: 'function', function: { name: 'mc_stopNav', description: '停止当前寻路', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_goal', description: '设定一个 Minecraft 任务目标，AI 会自动反复执行直到完成。完成后用 mc_goalDone 结束', parameters: { type: 'object', properties: { task: { type: 'string', description: '任务描述，如"收集 10 个橡木原木"' } }, required: ['task'] } } },
             { type: 'function', function: { name: 'mc_goalDone', description: '标记当前任务已完成', parameters: { type: 'object', properties: {}, required: [] } } },
-            { type: 'function', function: { name: 'mc_digBlock', description: '持续挖掘视线前方的方块直到破坏，自动捡掉落物。比 mc_dig 更智能，会等到方块真正破坏', parameters: { type: 'object', properties: { timeout: { type: 'number', description: '超时时间（秒），默认 10', default: 10 } }, required: [] } } },
+            { type: 'function', function: { name: 'mc_digBlock', description: '挖掘视线前方的方块直到破坏，自动捡掉落物。若之前 mc_goToBlock 标注过树/矿脉，会自动连续挖完所有标注方块：自动走向目标、自动挖掉路径遮挡、目标太高自动放置垫脚方块，直到全部挖完（超时会返回进度，可再次调用继续）', parameters: { type: 'object', properties: { timeout: { type: 'number', description: '超时时间（秒），默认 10（连续挖掘模式最长 90 秒）', default: 10 } }, required: [] } } },
             { type: 'function', function: { name: 'mc_digDown', description: '安全向下挖掘，会自动检测岩浆和水', parameters: { type: 'object', properties: { distance: { type: 'integer', description: '向下挖几格，默认 1', default: 1 } }, required: [] } } },
             { type: 'function', function: { name: 'mc_goToSurface', description: '回到地面（向上挖）', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_attackEntity', description: '攻击最近的实体（怪物、动物等）', parameters: { type: 'object', properties: { type: { type: 'string', description: '实体类型，如 zombie, skeleton, cow。留空攻击任意' }, range: { type: 'number', description: '搜索范围，默认 16', default: 16 } }, required: [] } } },
@@ -167,6 +192,9 @@ class MCControlPlugin extends Plugin {
                 const connected = this.mc && this.mc.connected;
                 const state = this.mc.getState();
                 let status = `连接状态: ${connected ? '已连接' : '未连接'}\n`;
+                if (connected && !state) {
+                    status += '⚠️ 已连上但未收到游戏状态：请确认只开了一个 Minecraft 实例、游戏已进入世界、8765 端口未被占用\n';
+                }
                 if (state) {
                     status += `位置: (${state.x?.toFixed(1)}, ${state.y?.toFixed(1)}, ${state.z?.toFixed(1)})\n`;
                     status += `生命值: ${state.health?.toFixed(1)}\n`;

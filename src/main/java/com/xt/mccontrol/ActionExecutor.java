@@ -10,6 +10,7 @@ import net.minecraft.client.option.KeyBinding;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.BlockItem;
 import net.minecraft.item.ItemStack;
 import net.minecraft.recipe.Ingredient;
 import net.minecraft.recipe.Recipe;
@@ -26,10 +27,16 @@ import net.minecraft.util.collection.DefaultedList;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -78,6 +85,23 @@ public class ActionExecutor {
         "dirt", "grass_block", "sand", "gravel", "tall_grass", "leaves",
         "cobblestone", "stone", "oak_planks", "oak_log", "birch_log", "spruce_log",
         "netherrack", "end_stone"
+    );
+
+    // === 连续挖掘标注（树/矿脉）===
+    // go_to_block 命中原木/矿物时，BFS 收集相连同 ID 方块存到这里，
+    // 之后 mc_digBlock 会连续挖完这些方块（自动清理遮挡、自动垫脚）
+    private static final LinkedHashSet<BlockPos> markedBlocks = new LinkedHashSet<>();
+    private static String markTag = "";
+    private static final Set<String> MARK_KEYWORDS = Set.of("log", "ore");
+    private static final int MAX_MARKED = 64;
+    private static final int[] MARK_DIR_X = {1, -1, 0, 0, 0, 0};
+    private static final int[] MARK_DIR_Y = {0, 0, 1, -1, 0, 0};
+    private static final int[] MARK_DIR_Z = {0, 0, 0, 0, 1, -1};
+    // 不能拿来垫脚的 BlockItem（门/火把/红石等无法踩踏的方块）
+    private static final Set<String> NON_PILLAR_KEYWORDS = Set.of(
+        "door", "fence", "torch", "button", "pressure", "plate", "rail", "redstone",
+        "flower", "sapling", "carpet", "banner", "sign", "trapdoor", "ladder",
+        "vine", "lever", "torchflower", "moss_carpet", "mud"
     );
 
     public static void execute(String commandJson) {
@@ -191,17 +215,9 @@ public class ActionExecutor {
                             return;
                         }
                     }
-                    HitResult hit = player.raycast(5.0, 0, false);
-                    if (hit.getType() == HitResult.Type.BLOCK) {
-                        ActionResult res = client.interactionManager.interactBlock(
-                                player, Hand.MAIN_HAND, (BlockHitResult) hit);
-                        String heldName = player.getMainHandStack().isEmpty()
-                                ? "空手" : player.getMainHandStack().getItem().getName().getString();
-                        sendResult("place", res.isAccepted(),
-                                res.isAccepted() ? "已放置 " + heldName : "放置失败");
-                    } else {
-                        sendResult("place", false, "未瞄准方块");
-                    }
+                    // 使用 PlaceTask：自动后退拉开距离、自动抬平视角后放置
+                    // （AI 导航常紧贴目标方块/视角朝下，直接放置会失败）
+                    startTask(client, new PlaceTask(), "place");
                 }
                 case "switch_slot" -> {
                     int slot = cmd.get("slot").getAsInt();
@@ -296,7 +312,12 @@ public class ActionExecutor {
                 case "dig_block" -> {
                     double timeout = cmd.has("timeout")
                             ? cmd.get("timeout").getAsDouble() : 10.0;
-                    startTask(client, new DigBlockTask(timeout), "dig_block");
+                    if (!markedBlocks.isEmpty()) {
+                        // 有 go_to_block 标注的树/矿脉：连续挖完所有标注方块
+                        startTask(client, new ChainDigTask(), "dig_block");
+                    } else {
+                        startTask(client, new DigBlockTask(timeout), "dig_block");
+                    }
                 }
 
                 // === 向下挖掘（安全） ===
@@ -577,7 +598,13 @@ public class ActionExecutor {
             double dz = tz - pz;
             double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
-            if (dist < 1.5) {
+            // 到达判定：水平贴住目标即可，垂直方向允许站在目标正上方或正下方
+            // （目标方块四周被围住时，只能从上方/下方接近，旧版只认侧面导致误报失败）
+            double hDist = Math.sqrt(dx * dx + dz * dz);
+            double vDist = Math.abs(dy);
+            if (hDist < 1.2 && vDist < 2.2) {
+                // 到达后把过度朝下的视角抬平，避免后续放置/观察视角异常
+                if (player.getPitch() < -45) player.setPitch(0);
                 if (emitResult) sendResult(resultAction, callId, true, "已到达目标位置");
                 return true;
             }
@@ -844,6 +871,156 @@ public class ActionExecutor {
         return false;
     }
 
+    /** 玩家当前面朝的水平方向（yaw 约定：0=南/+Z，顺时针） */
+    private static Direction facingDir(ClientPlayerEntity player) {
+        int rot = Math.floorMod((int) Math.round(player.getYaw() / 90.0) + 2, 4);
+        return Direction.fromHorizontal(rot);
+    }
+
+    /**
+     * 链式挖掘标注：go_to_block 命中原木/矿物时，BFS 收集与之相连的相同 ID 方块，
+     * 存入 {@link #markedBlocks}，之后 mc_digBlock 会连续挖完（树/整条矿脉）。
+     * 排除树叶等不连续方块：只沿同 ID 传播。
+     */
+    private static void markConnectedIfNeeded(ClientPlayerEntity player, BlockPos origin) {
+        BlockState state = player.getWorld().getBlockState(origin);
+        Identifier id = Registries.BLOCK.getId(state.getBlock());
+        if (id == null) return;
+        String idPath = id.getPath().toLowerCase();
+        boolean chainable = false;
+        for (String k : MARK_KEYWORDS) {
+            if (idPath.contains(k)) {
+                chainable = true;
+                break;
+            }
+        }
+        if (!chainable) return;
+
+        World world = player.getWorld();
+        markedBlocks.clear();
+        markTag = idPath;
+        Deque<BlockPos> queue = new ArrayDeque<>();
+        Set<BlockPos> visited = new HashSet<>();
+        queue.add(origin);
+        visited.add(origin);
+        while (!queue.isEmpty() && markedBlocks.size() < MAX_MARKED) {
+            BlockPos cur = queue.poll();
+            markedBlocks.add(cur);
+            for (int d = 0; d < 6; d++) {
+                BlockPos nb = cur.add(MARK_DIR_X[d], MARK_DIR_Y[d], MARK_DIR_Z[d]);
+                if (visited.add(nb)) {
+                    Identifier nid = Registries.BLOCK.getId(world.getBlockState(nb).getBlock());
+                    if (nid != null && nid.getPath().toLowerCase().equals(idPath)) {
+                        queue.add(nb);
+                    }
+                }
+            }
+        }
+        StateCollector.addBehaviorLog(
+                "已标注 " + markedBlocks.size() + " 个相连方块(" + idPath + ")，调用 mc_digBlock 可连续挖完");
+    }
+
+    // ======================== PlaceTask：放置（自动调整距离与视角） ========================
+
+    /**
+     * 放置方块。AI 导航到达目标后常紧贴目标方块且视角朝下（导航按视线朝目标移动），
+     * 导致放置距离不足或方向错误。本任务自动修正：
+     * 1) 与瞄准方块水平距离 < 1.6 格时自动后退到 1.8 格以上；
+     * 2) 视角朝下超过 30° 时自动抬平；
+     * 然后重新瞄准并放置，回报详细结果。
+     */
+    private static class PlaceTask implements ActionTask {
+        private static final int PREP = 0, BACKUP = 1, PLACE = 2;
+        private final long myVersion;
+        private final long callId = currentCallId;
+        private BlockPos anchor = null;   // 初始瞄准的方块（放置参照）
+        private int state = PREP;
+        private int stateTicks = 0;
+        private int backupTicks = 0;
+
+        PlaceTask() {
+            this.myVersion = actionVersion;
+        }
+
+        @Override
+        public boolean tick(MinecraftClient client, ClientPlayerEntity player) {
+            if (actionVersion != myVersion || navCancelled) {
+                client.options.backKey.setPressed(false);
+                return true;
+            }
+
+            switch (state) {
+                case PREP: {
+                    HitResult hit = player.raycast(5.0, 0, false);
+                    if (hit.getType() != HitResult.Type.BLOCK) {
+                        sendResult("place", callId, false,
+                                "未瞄准方块，请先看向要放置的位置（或用 mc_look/mc_turn 调整视角）");
+                        return true;
+                    }
+                    anchor = ((BlockHitResult) hit).getBlockPos();
+                    double dx = anchor.getX() + 0.5 - player.getX();
+                    double dz = anchor.getZ() + 0.5 - player.getZ();
+                    double anchorDist = Math.sqrt(dx * dx + dz * dz);
+                    if (anchorDist < 1.6 || player.getPitch() < -30) {
+                        state = BACKUP;
+                        stateTicks = 0;
+                        backupTicks = 0;
+                        return false;
+                    }
+                    state = PLACE;
+                    stateTicks = 0;
+                    return false;
+                }
+                case BACKUP: {
+                    stateTicks++;
+                    double dx = anchor.getX() + 0.5 - player.getX();
+                    double dz = anchor.getZ() + 0.5 - player.getZ();
+                    double anchorDist = Math.sqrt(dx * dx + dz * dz);
+                    // 朝向 anchor 后退，同时把视角抬平
+                    player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+                    player.setPitch(0);
+                    if (anchorDist < 1.8) {
+                        client.options.backKey.setPressed(true);
+                        backupTicks++;
+                    } else {
+                        client.options.backKey.setPressed(false);
+                        state = PLACE;
+                        stateTicks = 0;
+                        return false;
+                    }
+                    // 后退 1.5 秒仍拉不开距离（身后有墙）：直接尝试放置
+                    if (backupTicks > 30) {
+                        client.options.backKey.setPressed(false);
+                        state = PLACE;
+                        stateTicks = 0;
+                        return false;
+                    }
+                    return false;
+                }
+                default: { // PLACE
+                    client.options.backKey.setPressed(false);
+                    HitResult hit = player.raycast(5.0, 0, false);
+                    if (hit.getType() != HitResult.Type.BLOCK) {
+                        sendResult("place", callId, false,
+                                "未瞄准方块（调整距离后仍无目标），请换个位置再试");
+                        return true;
+                    }
+                    ActionResult res = client.interactionManager.interactBlock(
+                            player, Hand.MAIN_HAND, (BlockHitResult) hit);
+                    String heldName = player.getMainHandStack().isEmpty()
+                            ? "空手" : player.getMainHandStack().getItem().getName().getString();
+                    if (res.isAccepted()) {
+                        sendResult("place", callId, true, "已放置 " + heldName);
+                    } else {
+                        sendResult("place", callId, false,
+                                "放置失败，建议后退到 2-3 格外并保持水平视角再试（也可用 mc_look 先看向目标位置）");
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
     // ======================== DigBlockTask：持续挖掘 ========================
 
     private static class DigBlockTask implements ActionTask {
@@ -923,6 +1100,358 @@ public class ActionExecutor {
                 return true;
             }
             return false;
+        }
+    }
+
+    // ======================== ChainDigTask：连续挖掘标注方块（树/矿脉） ========================
+
+    /**
+     * 连续挖掘（树/矿脉）：把 go_to_block 标注的相连方块全部挖完。
+     * - 目标不可达时自动走过去；路径被挡自动挖掉遮挡（准星指向目标，MC 天然先挖路径方块）；
+     * - 目标太高（超出挖掘范围）时自动从背包找方块垫脚并跳上去；
+     * - 挖完一个自动挖下一个，直到标注清空；超时/中断返回进度。
+     */
+    private static class ChainDigTask implements ActionTask {
+        private static final int FIND = 0, WALK = 1, MINE = 2, PILLAR = 3;
+        private final long myVersion;
+        private final long callId = currentCallId;
+        private final long startTime;
+        private final long timeoutMs = 90000; // 90 秒
+        private int state = FIND;
+        private int stateTicks = 0;
+        private BlockPos target = null;
+        private BlockPos pillarPos = null;   // 已放置的垫脚方块
+        private double lastCheckX = 0, lastCheckZ = 0;
+        private int checkCounter = 0;
+        private int stuckCount = 0;
+        private int mined = 0;
+        private int skipped = 0;
+        private BlockPos lastUnbreakable = null; // 上次挖不动的方块（避免死循环）
+
+        ChainDigTask() {
+            this.myVersion = actionVersion;
+            this.startTime = System.currentTimeMillis();
+        }
+
+        @Override
+        public boolean tick(MinecraftClient client, ClientPlayerEntity player) {
+            if (actionVersion != myVersion || navCancelled) {
+                releaseAllKeys(client);
+                return true;
+            }
+            if (markedBlocks.isEmpty()) {
+                releaseAllKeys(client);
+                sendResult("dig_block", callId, true,
+                        "已连续挖完 " + mined + " 个标注方块"
+                                + (skipped > 0 ? "（跳过 " + skipped + " 个无法挖掘的）" : ""));
+                return true;
+            }
+            if (System.currentTimeMillis() - startTime > timeoutMs) {
+                releaseAllKeys(client);
+                sendResult("dig_block", callId, false,
+                        "连续挖掘超时：已挖 " + mined + " 个，剩余 " + markedBlocks.size()
+                                + " 个标注方块（再次调用 mc_digBlock 可继续）");
+                return true;
+            }
+
+            switch (state) {
+                case FIND: {
+                    target = pickReachable(player);
+                    if (target != null) {
+                        state = MINE;
+                    } else {
+                        target = pickNearest(player);
+                        if (target == null) {
+                            // 所有标注方块都挖不动（缺工具/全被基岩围住）
+                            releaseAllKeys(client);
+                            int remain = markedBlocks.size();
+                            markedBlocks.clear();
+                            sendResult("dig_block", callId, false,
+                                    "剩余 " + remain + " 个标注方块无法挖掘（可能缺少合适工具或被不可挖掘方块围住），已停止");
+                            return true;
+                        }
+                        state = WALK;
+                    }
+                    stateTicks = 0;
+                    stuckCount = 0;
+                    return false;
+                }
+                case MINE: {
+                    stateTicks++;
+                    if (player.getWorld().getBlockState(target).isAir()) {
+                        client.options.attackKey.setPressed(false);
+                        if (markedBlocks.remove(target)) {
+                            mined++;
+                            StateCollector.addBehaviorLog("连续挖掘: 挖完 " + target.toShortString()
+                                    + "（" + mined + "/" + (mined + markedBlocks.size()) + "）");
+                        } else {
+                            StateCollector.addBehaviorLog("连续挖掘: 清除路径遮挡 " + target.toShortString());
+                        }
+                        state = FIND;
+                        stateTicks = 0;
+                        return false;
+                    }
+                    // 锁定视角 + 按住攻击（准星指向目标，若路径中间有方块会先挖掉它）
+                    double dx = target.getX() + 0.5 - player.getX();
+                    double dy = target.getY() + 0.5
+                            - (player.getY() + player.getEyeHeight(player.getPose()));
+                    double dz = target.getZ() + 0.5 - player.getZ();
+                    double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                    player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+                    player.setPitch((float) Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz))));
+                    client.options.attackKey.setPressed(true);
+                    if (dist > 4.6) {
+                        // 走远了：停止挖掘，先靠近
+                        client.options.attackKey.setPressed(false);
+                        state = WALK;
+                        stateTicks = 0;
+                        return false;
+                    }
+                    // 挖了 12 秒仍未破坏（基岩/黑曜石/需要正确工具等）：跳过并记住
+                    if (stateTicks > 240) {
+                        client.options.attackKey.setPressed(false);
+                        lastUnbreakable = target;
+                        markedBlocks.remove(target);
+                        skipped++;
+                        StateCollector.addBehaviorLog("连续挖掘: 无法挖掘 " + target.toShortString() + "，跳过");
+                        state = FIND;
+                        stateTicks = 0;
+                        return false;
+                    }
+                    return false;
+                }
+                case WALK: {
+                    stateTicks++;
+                    double dx = target.getX() + 0.5 - player.getX();
+                    double dy = target.getY() + 0.5 - player.getY();
+                    double dz = target.getZ() + 0.5 - player.getZ();
+                    double hDist = Math.sqrt(dx * dx + dz * dz);
+                    double eyeDy = target.getY() + 0.5
+                            - (player.getY() + player.getEyeHeight(player.getPose()));
+                    player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+
+                    // 目标太高且已靠近：垫脚
+                    if (eyeDy > 4.5 && hDist < 3.0) {
+                        releaseAllKeys(client);
+                        state = PILLAR;
+                        stateTicks = 0;
+                        pillarPos = null;
+                        return false;
+                    }
+                    // 足够近且手够得着（含目标在脚下深处：朝下挖穿即可）
+                    if (hDist <= 4.5 && Math.abs(eyeDy) <= 4.5) {
+                        releaseAllKeys(client);
+                        state = MINE;
+                        stateTicks = 0;
+                        return false;
+                    }
+                    // 朝目标走，周期性小跳（跨台阶/栅栏）
+                    client.options.forwardKey.setPressed(true);
+                    if (stateTicks % 20 < 4) {
+                        client.options.jumpKey.setPressed(true);
+                    } else {
+                        client.options.jumpKey.setPressed(false);
+                    }
+
+                    // 卡住检测（每 10 tick 结算）
+                    checkCounter++;
+                    if (checkCounter >= 10) {
+                        double moved = Math.abs(player.getX() - lastCheckX)
+                                + Math.abs(player.getZ() - lastCheckZ);
+                        if (moved < 0.15) {
+                            stuckCount++;
+                        } else {
+                            stuckCount = 0;
+                        }
+                        lastCheckX = player.getX();
+                        lastCheckZ = player.getZ();
+                        checkCounter = 0;
+                    }
+                    if (stuckCount >= 2) {
+                        releaseAllKeys(client);
+                        // 优先挖掉路径遮挡
+                        BlockPos ob = findBlockInFront(player);
+                        if (ob != null && isBreakable(player, ob)) {
+                            if (ob.equals(lastUnbreakable)) {
+                                // 这个遮挡上次挖不动：跳过当前目标换下一个
+                                markedBlocks.remove(target);
+                                skipped++;
+                                StateCollector.addBehaviorLog("连续挖掘: 路径遮挡无法挖掘，跳过目标");
+                                state = FIND;
+                                stateTicks = 0;
+                                stuckCount = 0;
+                                return false;
+                            }
+                            target = ob;
+                            state = MINE;
+                            stateTicks = 0;
+                            stuckCount = 0;
+                            return false;
+                        }
+                        // 不可挖：跳过该目标换下一个
+                        markedBlocks.remove(target);
+                        skipped++;
+                        StateCollector.addBehaviorLog("连续挖掘: 目标被不可挖掘方块阻挡，跳过");
+                        state = FIND;
+                        stateTicks = 0;
+                        stuckCount = 0;
+                        return false;
+                    }
+                    // 走 30 秒仍未接近：换下一个目标
+                    if (stateTicks > 600) {
+                        releaseAllKeys(client);
+                        markedBlocks.remove(target);
+                        skipped++;
+                        StateCollector.addBehaviorLog("连续挖掘: 目标无法到达，跳过");
+                        state = FIND;
+                        stateTicks = 0;
+                        stuckCount = 0;
+                        return false;
+                    }
+                    return false;
+                }
+                default: { // PILLAR：垫脚
+                    stateTicks++;
+                    if (pillarPos != null) {
+                        // 已放置：跳上去（持续前进+跳跃直到站到垫脚方块上方）
+                        double dx = target.getX() + 0.5 - player.getX();
+                        double dz = target.getZ() + 0.5 - player.getZ();
+                        player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+                        client.options.forwardKey.setPressed(true);
+                        client.options.jumpKey.setPressed(true);
+                        if (player.getY() > pillarPos.getY() + 0.9) {
+                            releaseAllKeys(client);
+                            pillarPos = null;
+                            state = WALK;
+                            stateTicks = 0;
+                            stuckCount = 0;
+                            return false;
+                        }
+                        if (stateTicks > 40) { // 2 秒没站上去
+                            releaseAllKeys(client);
+                            pillarPos = null;
+                            markedBlocks.remove(target);
+                            skipped++;
+                            StateCollector.addBehaviorLog("连续挖掘: 垫脚失败，跳过高处目标");
+                            state = FIND;
+                            stateTicks = 0;
+                            return false;
+                        }
+                        return false;
+                    }
+                    // 找垫脚方块
+                    int slot = findPillarSlot(client, player);
+                    if (slot < 0) {
+                        markedBlocks.remove(target);
+                        skipped++;
+                        StateCollector.addBehaviorLog("连续挖掘: 背包没有可垫脚的方块，跳过高处目标");
+                        state = FIND;
+                        stateTicks = 0;
+                        return false;
+                    }
+                    player.getInventory().selectedSlot = slot;
+                    // 放置到玩家前方一格（地面上的空气位置）
+                    double dx = target.getX() + 0.5 - player.getX();
+                    double dz = target.getZ() + 0.5 - player.getZ();
+                    player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+                    BlockPos front = player.getBlockPos().offset(facingDir(player));
+                    BlockPos ground = front.down();
+                    World world = player.getWorld();
+                    if (!world.getBlockState(front).isAir()) {
+                        // 前方已有方块：直接跳上去
+                        pillarPos = front;
+                        stateTicks = 0;
+                        return false;
+                    }
+                    if (!world.getBlockState(ground).isAir()) {
+                        // 点击地面顶面，新方块会出现在 front
+                        Vec3d hitPos = new Vec3d(ground.getX() + 0.5, ground.getY() + 1.0, ground.getZ() + 0.5);
+                        BlockHitResult bhr = new BlockHitResult(hitPos, Direction.UP, ground, false);
+                        ActionResult res = client.interactionManager
+                                .interactBlock(player, Hand.MAIN_HAND, bhr);
+                        if (res.isAccepted()) {
+                            pillarPos = front;
+                            stateTicks = 0;
+                            StateCollector.addBehaviorLog("连续挖掘: 放置垫脚方块 " + front.toShortString());
+                            return false;
+                        }
+                    }
+                    // 放置失败（悬崖/低洼等）：跳过该目标
+                    markedBlocks.remove(target);
+                    skipped++;
+                    StateCollector.addBehaviorLog("连续挖掘: 垫脚位置不合适，跳过高处目标");
+                    state = FIND;
+                    stateTicks = 0;
+                    return false;
+                }
+            }
+        }
+
+        /** 从标注集合中选一个当前伸手够得着的方块（排除上次挖不动的） */
+        private BlockPos pickReachable(ClientPlayerEntity player) {
+            for (BlockPos p : markedBlocks) {
+                if (p.equals(lastUnbreakable)) continue;
+                double hDist = Math.sqrt(
+                        (p.getX() + 0.5 - player.getX()) * (p.getX() + 0.5 - player.getX())
+                                + (p.getZ() + 0.5 - player.getZ()) * (p.getZ() + 0.5 - player.getZ()));
+                double eyeDy = p.getY() + 0.5 - (player.getY() + player.getEyeHeight(player.getPose()));
+                if (hDist <= 4.5 && Math.abs(eyeDy) <= 4.5) {
+                    return p;
+                }
+            }
+            return null;
+        }
+
+        /** 从标注集合中选最近的一个（排除上次挖不动的） */
+        private BlockPos pickNearest(ClientPlayerEntity player) {
+            BlockPos best = null;
+            double bestD = Double.MAX_VALUE;
+            for (BlockPos p : markedBlocks) {
+                if (p.equals(lastUnbreakable)) continue;
+                double d = player.squaredDistanceTo(p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5);
+                if (d < bestD) {
+                    bestD = d;
+                    best = p;
+                }
+            }
+            return best;
+        }
+
+        /** 从背包找一个能当垫脚的方块槽位（优先手持/快捷栏，其次背包并交换到快捷栏） */
+        private int findPillarSlot(MinecraftClient client, ClientPlayerEntity player) {
+            PlayerInventory inv = player.getInventory();
+            // 1) 当前手持
+            ItemStack held = player.getMainHandStack();
+            if (!held.isEmpty() && isPillarBlock(held)) {
+                return inv.selectedSlot;
+            }
+            // 2) 快捷栏 0-8
+            for (int i = 0; i < 9; i++) {
+                ItemStack stack = inv.getStack(i);
+                if (!stack.isEmpty() && isPillarBlock(stack)) {
+                    return i;
+                }
+            }
+            // 3) 背包 9-35：交换到快捷栏 0
+            for (int i = 9; i < 36; i++) {
+                ItemStack stack = inv.getStack(i);
+                if (!stack.isEmpty() && isPillarBlock(stack)) {
+                    inv.selectedSlot = 0;
+                    client.interactionManager.pickFromInventory(i);
+                    return 0;
+                }
+            }
+            return -1;
+        }
+
+        private boolean isPillarBlock(ItemStack stack) {
+            if (!(stack.getItem() instanceof BlockItem)) return false;
+            Identifier id = Registries.ITEM.getId(stack.getItem());
+            String idPath = id != null ? id.getPath().toLowerCase() : "";
+            for (String k : NON_PILLAR_KEYWORDS) {
+                if (idPath.contains(k)) return false;
+            }
+            return true;
         }
     }
 
@@ -1239,7 +1768,10 @@ public class ActionExecutor {
                     }
                     // 材料不足（可能已被前几轮消耗）
                     player.closeHandledScreen();
-                    sendResult("craft", callId, false, "合成材料不足: " + ing.toJson());
+                    String ingDesc = "未知材料";
+                    ItemStack[] matchStacks = ing.getMatchingStacks();
+                    if (matchStacks.length > 0) ingDesc = matchStacks[0].getName().getString();
+                    sendResult("craft", callId, false, "合成材料不足: " + ingDesc);
                     return true;
                 }
                 case 3: { // 等待网格填充完成
@@ -1389,12 +1921,13 @@ public class ActionExecutor {
             DefaultedList<Ingredient> ings = recipe.recipe.getIngredients();
             int gridW = (tablePos != null) ? 3 : 2;
             if (recipe.recipe instanceof ShapedRecipe shaped) {
-                // 1.20.1: getPattern is not public, use width/height + ingredients
-                int w = shaped.getWidth();
-                int h = shaped.getHeight();
-                for (int row = 0; row < h; row++) {
-                    for (int col = 0; col < w; col++) {
-                        int idx = row * w + col;
+                // Yarn 1.20.1 的 ShapedRecipe 没有无参 getPattern()，
+                // 直接用 width/height 按行主序遍历 ingredients（含空位），等价于 pattern 摆放
+                int width = shaped.getWidth();
+                int height = shaped.getHeight();
+                for (int row = 0; row < height; row++) {
+                    for (int col = 0; col < width; col++) {
+                        int idx = row * width + col;
                         if (idx >= ings.size() || ings.get(idx).isEmpty()) continue;
                         manualCells.add(row * gridW + col + 1);
                         manualIngredients.add(ings.get(idx));
@@ -1507,6 +2040,9 @@ public class ActionExecutor {
         }
 
         if (nearest != null) {
+            // 链式挖掘标注：目标是原木/矿物时，自动标注相连的相同方块（树/矿脉），
+            // 之后 mc_digBlock 会连续挖完所有标注方块
+            markConnectedIfNeeded(player, nearest);
             // 不立即发送结果——让 NavTask 完成后发送到达/超时结果
             // emitResult=true 使 NavTask 在到达或超时时调用 sendResult
             startTask(client, new NavTask(player, nearest.getX() + 0.5, nearest.getY(),

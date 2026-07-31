@@ -122,7 +122,7 @@ class MCControlPlugin extends Plugin {
             { type: 'function', function: { name: 'mc_look', description: '查看 Minecraft 当前状态：位置、视线、背包、脚下', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_move', description: '控制角色移动', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['forward', 'back', 'left', 'right'], description: '移动方向' }, duration: { type: 'number', description: '移动时长（秒），默认 0.5', default: 0.5 } }, required: ['direction'] } } },
             { type: 'function', function: { name: 'mc_dig', description: '挖掘/攻击视线前方的方块，默认持续 2 秒', parameters: { type: 'object', properties: { duration: { type: 'number', description: '挖掘时长（秒），木头约 2s，石头约 3-5s', default: 2.0 } }, required: [] } } },
-            { type: 'function', function: { name: 'mc_place', description: '在视线前方放置方块', parameters: { type: 'object', properties: {}, required: [] } } },
+            { type: 'function', function: { name: 'mc_place', description: '在视线前方放置方块。可指定物品名称自动切换到对应槽位，不指定则放置当前手持物品', parameters: { type: 'object', properties: { item_name: { type: 'string', description: '要放置的物品名称或 ID，如 crafting_table, dirt, oak_planks。不传则放置当前手持物品' } }, required: [] } } },
             { type: 'function', function: { name: 'mc_jump', description: '跳跃', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_switch', description: '切换快捷栏物品', parameters: { type: 'object', properties: { slot: { type: 'integer', description: '槽位号 (0-8)' } }, required: ['slot'] } } },
             { type: 'function', function: { name: 'mc_turn', description: '转动视角', parameters: { type: 'object', properties: { yaw: { type: 'number', description: '水平角度（0=正南, 正值=向西转, 负值=向东转）' }, pitch: { type: 'number', description: '垂直角度（正值=向上看, 负值=向下看, 范围-90到90）' } }, required: ['yaw', 'pitch'] } } },
@@ -180,7 +180,10 @@ class MCControlPlugin extends Plugin {
                 const { duration = 2.0 } = params || {};
                 return this.sendActionAndWait({ action: 'attack', duration });
             }
-            case 'mc_place': return this.sendActionAndWait({ action: 'place' });
+            case 'mc_place': {
+                const { item_name = '' } = params || {};
+                return this.sendActionAndWait({ action: 'place', item_name });
+            }
             case 'mc_jump': return this.sendActionAndWait({ action: 'jump' });
             case 'mc_switch': {
                 const { slot } = params;

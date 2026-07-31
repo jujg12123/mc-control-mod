@@ -132,6 +132,20 @@ public class StateCollector {
         state.addProperty("on_ground", player.isOnGround());
         state.addProperty("y_feet", round(player.getY()));
 
+        // 头顶方块信息（玩家眼睛位置上方 1 格）
+        // 用于让 AI 感知头顶是否被方块挡住，避免一直跳跃
+        BlockPos headPos = player.getBlockPos().up();
+        BlockState headBlock = player.getWorld().getBlockState(headPos);
+        if (!headBlock.isAir()) {
+            String headName = headBlock.getBlock().getName().getString();
+            Identifier headId = Registries.BLOCK.getId(headBlock.getBlock());
+            state.addProperty("block_above", headName);
+            state.addProperty("block_above_id", headId != null ? headId.toString() : "unknown");
+        } else {
+            state.addProperty("block_above", "air");
+            state.addProperty("block_above_id", "minecraft:air");
+        }
+
         // 饥饿值和饱和度
         state.addProperty("food_level", player.getHungerManager().getFoodLevel());
         state.addProperty("saturation", player.getHungerManager().getSaturationLevel());

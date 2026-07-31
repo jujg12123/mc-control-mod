@@ -129,11 +129,56 @@ public class ActionExecutor {
                     sendResult("attack", true, "攻击/挖掘 " + duration + "秒");
                 }
                 case "place" -> {
+                    // 支持指定物品名称：自动在背包查找并切换到快捷栏对应槽位
+                    String itemName = cmd.has("item_name")
+                            ? cmd.get("item_name").getAsString() : "";
+                    if (!itemName.isEmpty()) {
+                        PlayerInventory inv = player.getInventory();
+                        int foundSlot = -1;
+                        // 先在快捷栏 0-8 查找
+                        for (int i = 0; i < 9; i++) {
+                            ItemStack stack = inv.getStack(i);
+                            if (!stack.isEmpty()) {
+                                String name = stack.getItem().getName().getString().toLowerCase();
+                                Identifier id = Registries.ITEM.getId(stack.getItem());
+                                String idPath = id != null ? id.getPath().toLowerCase() : "";
+                                if (name.contains(itemName.toLowerCase()) || idPath.contains(itemName.toLowerCase())) {
+                                    foundSlot = i;
+                                    break;
+                                }
+                            }
+                        }
+                        if (foundSlot >= 0) {
+                            inv.selectedSlot = foundSlot;
+                        } else {
+                            // 快捷栏没有，在背包 9-35 查找并交换到快捷栏
+                            for (int i = 9; i < 36; i++) {
+                                ItemStack stack = inv.getStack(i);
+                                if (!stack.isEmpty()) {
+                                    String name = stack.getItem().getName().getString().toLowerCase();
+                                    Identifier id = Registries.ITEM.getId(stack.getItem());
+                                    String idPath = id != null ? id.getPath().toLowerCase() : "";
+                                    if (name.contains(itemName.toLowerCase()) || idPath.contains(itemName.toLowerCase())) {
+                                        client.interactionManager.pickFromInventory(i);
+                                        foundSlot = i;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (foundSlot < 0) {
+                            sendResult("place", false, "背包中未找到: " + itemName);
+                            return;
+                        }
+                    }
                     HitResult hit = player.raycast(5.0, 0, false);
                     if (hit.getType() == HitResult.Type.BLOCK) {
                         ActionResult res = client.interactionManager.interactBlock(
                                 player, Hand.MAIN_HAND, (BlockHitResult) hit);
-                        sendResult("place", res.isAccepted(), res.isAccepted() ? "已放置" : "放置失败");
+                        String heldName = player.getMainHandStack().isEmpty()
+                                ? "空手" : player.getMainHandStack().getItem().getName().getString();
+                        sendResult("place", res.isAccepted(),
+                                res.isAccepted() ? "已放置 " + heldName : "放置失败");
                     } else {
                         sendResult("place", false, "未瞄准方块");
                     }
@@ -517,7 +562,18 @@ public class ActionExecutor {
             if (moved < 0.05) {
                 stuckTicks++;
                 if (stuckTicks == 5) {
-                    // 跳一下
+                    // 先检查头顶是否被挡住：如果是，挖掉头顶方块而非跳跃
+                    BlockPos headBlock = player.getBlockPos().up();
+                    if (!player.getWorld().getBlockState(headBlock).isAir()) {
+                        // 头顶有方块，进入挖掘状态
+                        state = BREAKING;
+                        stateTicks = 0;
+                        client.options.forwardKey.setPressed(false);
+                        player.setPitch(-90f); // 抬头看头顶
+                        client.options.attackKey.setPressed(true);
+                        return false;
+                    }
+                    // 头顶没方块，跳一下
                     applyMove(client, player, yaw, pitch, true, 0);
                 } else if (stuckTicks == 15) {
                     strafeDir = (strafeDir == 0) ? 1 : (strafeDir == 1 ? -1 : 1);
@@ -643,6 +699,8 @@ public class ActionExecutor {
         private final long timeoutMs;
         private final long startTime;
         private BlockPos targetPos;
+        private BlockState targetBlockState;  // 记录初始方块状态，用于校验是否挖对了
+        private String targetBlockName;       // 目标方块名称（用于结果报告）
         private boolean initialized = false;
 
         DigBlockTask(double timeout) {
@@ -670,15 +728,18 @@ public class ActionExecutor {
                     sendResult("dig_block", false, "目标方块是空气");
                     return true;
                 }
+                targetBlockState = s;
+                targetBlockName = s.getBlock().getName().getString();
                 System.out.println("[MC-Control] Digging " +
-                        s.getBlock().getName().getString() + " at " + targetPos.toShortString());
+                        targetBlockName + " at " + targetPos.toShortString());
                 initialized = true;
                 client.options.attackKey.setPressed(true);
                 return false;
             }
 
-            // 检查是否已破坏
-            if (player.getWorld().getBlockState(targetPos).isAir()) {
+            // 检查目标位置是否已变成空气（已被破坏）
+            BlockState currentState = player.getWorld().getBlockState(targetPos);
+            if (currentState.isAir()) {
                 client.options.attackKey.setPressed(false);
                 // 延迟向前走捡掉落物（scheduler + client.execute，线程安全）
                 scheduler.schedule(() ->
@@ -688,7 +749,18 @@ public class ActionExecutor {
                                     client.execute(() -> client.options.forwardKey.setPressed(false)),
                                     500, TimeUnit.MILLISECONDS);
                         }), 300, TimeUnit.MILLISECONDS);
-                sendResult("dig_block", true, "方块已破坏");
+                sendResult("dig_block", true, "已破坏 " + targetBlockName);
+                return true;
+            }
+
+            // 校验：目标位置的方块类型是否与初始一致
+            // 如果方块类型变了（比如被其他因素替换），说明可能挖错了
+            if (currentState.getBlock() != targetBlockState.getBlock()) {
+                client.options.attackKey.setPressed(false);
+                String actualName = currentState.getBlock().getName().getString();
+                sendResult("dig_block", false,
+                    "目标方块类型已改变: 原目标=" + targetBlockName + ", 当前=" + actualName
+                    + "。可能挖错了方块，请重新瞄准。");
                 return true;
             }
 
@@ -931,11 +1003,11 @@ public class ActionExecutor {
                     }
                     return false;
                 }
-                case 2: { // clickRecipe 填充合成网格
+                case 2: { // clickRecipe 填充合成网格（单次合成，不消耗全部材料）
                     try {
                         int syncId = player.currentScreenHandler.syncId;
-                        // craftAll=true 让服务端尽量用全部材料合成
-                        client.interactionManager.clickRecipe(syncId, recipe.recipe, true);
+                        // craftAll=false: 只合成一次，不把所有材料都消耗掉
+                        client.interactionManager.clickRecipe(syncId, recipe.recipe, false);
                     } catch (Exception e) {
                         player.closeHandledScreen();
                         sendResult("craft", false, "填充合成网格失败: " + e.getMessage());
@@ -1012,7 +1084,7 @@ public class ActionExecutor {
                     phase = 5;
                     return false;
                 }
-                case 5: { // 取出产物（智能选择 shift-click 或普通点击）
+                case 5: { // 取出产物（shift-click 转移到背包，每次只取一次合成结果）
                     ItemStack output = player.currentScreenHandler.getSlot(0).getStack();
                     if (output.isEmpty()) {
                         // 产物槽空了，可能已取出
@@ -1021,18 +1093,9 @@ public class ActionExecutor {
                     }
 
                     int syncId = player.currentScreenHandler.syncId;
-                    int remaining = count - craftsDone;
-                    boolean takeAll = remaining >= 1; // 每次取出全部（shift-click）
-
-                    if (takeAll) {
-                        // shift-click 全部取出到背包
-                        client.interactionManager.clickSlot(
-                                syncId, 0, 0, SlotActionType.QUICK_MOVE, player);
-                    } else {
-                        // 普通点击取出一个到光标
-                        client.interactionManager.clickSlot(
-                                syncId, 0, 0, SlotActionType.PICKUP, player);
-                    }
+                    // shift-click 将产物槽的物品转移到背包
+                    client.interactionManager.clickSlot(
+                            syncId, 0, 0, SlotActionType.QUICK_MOVE, player);
                     phase = 6;
                     phaseTicks = 0;
                     slotCooldown = 3;

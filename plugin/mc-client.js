@@ -164,6 +164,12 @@ class MCClient {
             lines.push(`脚下: ${state.block_below}${idHint} (${ground})`);
         }
 
+        // 头顶信息（让 AI 感知头顶是否被挡住）
+        if (state.block_above && state.block_above !== 'air') {
+            const idHint = state.block_above_id ? ` [${state.block_above_id}]` : '';
+            lines.push(`头顶: ${state.block_above}${idHint} (被挡住, 跳跃无效)`);
+        }
+
         if (state.inventory) {
             const items = state.inventory
                 .filter(i => i.name !== 'empty')

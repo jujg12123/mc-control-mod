@@ -2439,7 +2439,12 @@ public class ActionExecutor {
             for (int i = 0; i < 36; i++) {
                 ItemStack s = inv.getStack(i);
                 if (s.isEmpty()) continue;
-                if (AbstractFurnaceScreenHandler.createFuelTimeMap().containsKey(s.getItem())) return i;
+                // 1.20.1: 检查常见燃料
+                String name = Registries.ITEM.getId(s.getItem()).getPath();
+                if (name.contains("coal") || name.contains("charcoal") || 
+                    name.contains("plank") || name.contains("log") || 
+                    name.contains("wood") || name.contains("stick") ||
+                    name.contains("lava_bucket") || name.contains("blaze_rod")) return i;
             }
             return -1;
         }

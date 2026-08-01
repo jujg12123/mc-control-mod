@@ -2,6 +2,7 @@ package com.xt.mccontrol;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ingame.InventoryScreen;
@@ -17,6 +18,7 @@ import net.minecraft.recipe.Recipe;
 import net.minecraft.recipe.ShapedRecipe;
 import net.minecraft.recipe.ShapelessRecipe;
 import net.minecraft.registry.Registries;
+import net.minecraft.screen.AbstractFurnaceScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.Hand;
@@ -35,6 +37,7 @@ import net.minecraft.world.World;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -543,7 +546,7 @@ public class ActionExecutor {
      * 卡住时进入 BREAKING（挖障碍）或 BYPASS（绕行）子状态。
      */
     private static class NavTask implements ActionTask {
-        private static final int NAV = 0, BREAKING = 1, BYPASS = 2;
+        private static final int NAV = 0, BREAKING = 1, BYPASS = 2, PILLAR = 3, DRILL_DOWN = 4;
         private final double tx, ty, tz;
         private final boolean emitResult;
         private final long myVersion;
@@ -554,6 +557,7 @@ public class ActionExecutor {
         private int checkCounter = 0;
         private int stuckCount = 0;              // 连续无进展的窗口数
         private int jumpTicks = 0;               // 跳跃按键保持 tick 数
+        private int jumpCooldown = 0;            // 跳跃间隔（避免连续蹦跳）
         private int totalTicks = 0;
         private final int maxTicks = 600;        // 约 30 秒（20 TPS）
         private int strafeDir = 0;
@@ -561,6 +565,12 @@ public class ActionExecutor {
         private int stateTicks = 0;
         private BlockPos targetObstacle = null;  // BREAKING 正在挖掘的方块
         private double bypassStartX = 0, bypassStartZ = 0;
+        // A* 路径点（玩家当前层可行走路径），沿路径点走避免直线撞墙/掉坑
+        private List<BlockPos> path = null;
+        private int pathIdx = 0;
+        private int replanTicks = 0;
+        private BlockPos pillarPos = null;   // PILLAR 已放置的垫脚方块
+        private boolean pillarJumped = false;
 
         NavTask(ClientPlayerEntity player, double tx, double ty, double tz, boolean emitResult, String resultAction) {
             this.tx = tx; this.ty = ty; this.tz = tz;
@@ -587,6 +597,14 @@ public class ActionExecutor {
             if (state == BYPASS) {
                 return tickBypass(client, player);
             }
+            // ---- 子状态：向下挖穿（目标在脚下）----
+            if (state == DRILL_DOWN) {
+                return tickDrillDown(client, player);
+            }
+            // ---- 子状态：垫脚（目标太高够不着）----
+            if (state == PILLAR) {
+                return tickPillar(client, player);
+            }
 
             // ---- 正常导航 ----
             totalTicks++;
@@ -596,7 +614,6 @@ public class ActionExecutor {
             double dx = tx - px;
             double dy = ty - py;
             double dz = tz - pz;
-            double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
             // 到达判定：水平贴住目标即可，垂直方向允许站在目标正上方或正下方
             // （目标方块四周被围住时，只能从上方/下方接近，旧版只认侧面导致误报失败）
@@ -613,10 +630,64 @@ public class ActionExecutor {
                 return true;
             }
 
-            double yaw = Math.toDegrees(Math.atan2(-dx, dz));
-            double pitch = Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+            // 目标在脚下（水平已贴住但垂直差较大）：直接向下挖穿，不再对着地面抽动视角
+            if (hDist < 1.5 && ty < player.getY() - 1.2) {
+                startDrillDown(client, player);
+                return false;
+            }
+            // 目标太高且水平已贴近（够不着）：尝试垫脚
+            double eyeDy = ty - (player.getY() + player.getEyeHeight(player.getPose()));
+            if (eyeDy > 3.4 && hDist < 2.2) {
+                startPillar(client, player);
+                return false;
+            }
 
-            // 跳跃按键计时（保持 4 tick 让跳跃真正生效，避免“抽搐”式单 tick 点按）
+            // ---- 路径规划：沿可行走路径移动，自动绕开障碍/台阶/坑 ----
+            replanTicks--;
+            if (path == null || pathIdx >= path.size() || replanTicks <= 0) {
+                path = findPath(player, tx, ty, tz);
+                pathIdx = 0;
+                replanTicks = 15;
+            }
+
+            // 目标点：当前路径点（有路径时），否则直线兜底
+            double gx = tx, gz = tz;
+            if (path != null && pathIdx < path.size()) {
+                BlockPos wp = path.get(pathIdx);
+                gx = wp.getX() + 0.5;
+                gz = wp.getZ() + 0.5;
+                double wdx = gx - px;
+                double wdz = gz - pz;
+                if (Math.sqrt(wdx * wdx + wdz * wdz) < 0.8) {
+                    pathIdx++;
+                    if (pathIdx >= path.size()) {
+                        path = null;   // 路径走完：重新规划或直线到目标
+                    }
+                }
+            }
+            double gdx = gx - px;
+            double gdz = gz - pz;
+            double yaw = Math.toDegrees(Math.atan2(-gdx, gdz));
+            // 移动时保持水平视角（不再朝目标上下甩头，避免视角抽搐；挖掘在子状态内进行）
+            double pitch = 0;
+            // 跳跃需求：路径点比玩家高 1 格以上时需要跳上去
+            double needJump = 0;
+            if (path != null && pathIdx < path.size()) {
+                needJump = path.get(pathIdx).getY() + 0.5 - player.getY();
+            } else if (ty > player.getY() + 3.0) {
+                pitch = Math.min(25, Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz))));
+            }
+
+            // 跳跃按键计时（跳 4 tick、停 12 tick，避免连续蹦跳）
+            if (needJump > 1.1) {
+                if (jumpCooldown <= 0) {
+                    jumpTicks = 4;
+                    jumpCooldown = 12;
+                }
+            } else {
+                jumpCooldown = 0;
+            }
+            if (jumpCooldown > 0) jumpCooldown--;
             if (jumpTicks > 0) {
                 jumpTicks--;
                 client.options.jumpKey.setPressed(true);
@@ -643,7 +714,14 @@ public class ActionExecutor {
                 checkCounter = 0;
 
                 if (stuckCount >= 2) {
-                    // 卡住 ≥1 秒：优先尝试挖掘正前方的阻挡方块
+                    // 卡住 ≥1 秒：路径失效，强制重新规划
+                    path = null;
+                    // 目标在脚下（被地面挡住走不动）：直接挖脚下
+                    if (hDist < 1.5 && ty < player.getY() - 0.5) {
+                        startDrillDown(client, player);
+                        return false;
+                    }
+                    // 优先尝试挖掘正前方的阻挡方块
                     BlockPos obstacle = findBlockInFront(player, tx, ty, tz);
                     if (obstacle != null) {
                         if (isBreakable(player, obstacle)) {
@@ -672,6 +750,153 @@ public class ActionExecutor {
                 applyMove(client, player, yaw, pitch, false, 0);
             }
             return false;
+        }
+        /** 向下挖穿子状态：目标在脚下时挖穿脚下地面逐层下降（不再对着目标猛低头导致视角抽搐） */
+        private boolean tickDrillDown(MinecraftClient client, ClientPlayerEntity player) {
+            stateTicks++;
+            double dx = tx - player.getX();
+            double dz = tz - player.getZ();
+            double hDist = Math.sqrt(dx * dx + dz * dz);
+            // 已接近目标层：结束下挖
+            if (hDist < 1.2 && Math.abs(ty - player.getY()) < 2.2) {
+                endDrillDown(client, player);
+                return false;
+            }
+            BlockPos foot = player.getBlockPos().down();
+            BlockState footState = player.getWorld().getBlockState(foot);
+            String name = footState.getBlock().getName().getString().toLowerCase();
+            if (footState.isAir()) {
+                // 脚下已挖空：等待自然下落（一次只掉 1 格，无摔落伤害）
+                client.options.attackKey.setPressed(false);
+                client.options.sneakKey.setPressed(false);
+                client.options.forwardKey.setPressed(false);
+                return false;
+            }
+            // 危险/不可挖方块：放弃并提示
+            if (name.contains("lava") || name.contains("water") || name.contains("bedrock")
+                    || name.contains("obsidian")) {
+                client.options.attackKey.setPressed(false);
+                sendResult(resultAction, callId, false,
+                        "目标下方是" + name + "，无法继续下挖，请换位置或换目标");
+                return true;
+            }
+            // 向下看并挖掘脚下方块（水平方向仍朝目标）
+            player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+            player.setPitch(90f);
+            client.options.forwardKey.setPressed(false);
+            client.options.sneakKey.setPressed(false);
+            client.options.attackKey.setPressed(true);
+            // 挖了 8 秒仍未挖穿（基岩/黑曜石等）：放弃
+            if (stateTicks > 160) {
+                client.options.attackKey.setPressed(false);
+                sendResult(resultAction, callId, false, "脚下方块无法挖掘，已停止下挖（请换位置）");
+                return true;
+            }
+            return false;
+        }
+
+        private void startDrillDown(MinecraftClient client, ClientPlayerEntity player) {
+            state = DRILL_DOWN;
+            stateTicks = 0;
+            client.options.attackKey.setPressed(false);
+            client.options.jumpKey.setPressed(false);
+            client.options.forwardKey.setPressed(false);
+            StateCollector.addBehaviorLog("目标在脚下，开始向下挖掘");
+        }
+
+        private void endDrillDown(MinecraftClient client, ClientPlayerEntity player) {
+            client.options.attackKey.setPressed(false);
+            client.options.sneakKey.setPressed(false);
+            client.options.forwardKey.setPressed(false);
+            state = NAV;
+            stuckCount = 0;
+            lastCheckX = player.getX();
+            lastCheckZ = player.getZ();
+            checkCounter = 0;
+            path = null;
+        }
+
+        /** 垫脚子状态：目标太高够不着时，从背包找方块垫到身边并跳上去 */
+        private boolean tickPillar(MinecraftClient client, ClientPlayerEntity player) {
+            stateTicks++;
+            if (pillarPos != null) {
+                // 已放置垫脚方块：朝目标前进+跳跃，直到站上垫脚方块
+                double dx = tx - player.getX();
+                double dz = tz - player.getZ();
+                player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+                player.setPitch(0);
+                client.options.forwardKey.setPressed(true);
+                client.options.jumpKey.setPressed(true);
+                if (player.getY() > pillarPos.getY() + 0.9) {
+                    endPillar(client, player);
+                    return false;
+                }
+                if (stateTicks > 40) {
+                    // 2 秒没站上去：放弃垫脚
+                    endPillar(client, player);
+                    StateCollector.addBehaviorLog("寻路垫脚失败，继续尝试直接前进");
+                    return false;
+                }
+                return false;
+            }
+            // 找垫脚方块并放置到前方一格的地面上
+            int slot = findPillarSlot(client, player);
+            if (slot < 0) {
+                StateCollector.addBehaviorLog("背包没有可垫脚的方块，放弃垫脚");
+                state = NAV;
+                return false;
+            }
+            player.getInventory().selectedSlot = slot;
+            double dx = tx - player.getX();
+            double dz = tz - player.getZ();
+            player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+            player.setPitch(0);
+            BlockPos front = player.getBlockPos().offset(facingDir(player));
+            BlockPos ground = front.down();
+            World world = player.getWorld();
+            if (!world.getBlockState(front).isAir()) {
+                // 前方已有方块：直接跳上去
+                pillarPos = front;
+                stateTicks = 0;
+                return false;
+            }
+            if (!world.getBlockState(ground).isAir()) {
+                Vec3d hitPos = new Vec3d(ground.getX() + 0.5, ground.getY() + 1.0, ground.getZ() + 0.5);
+                BlockHitResult bhr = new BlockHitResult(hitPos, Direction.UP, ground, false);
+                ActionResult res = client.interactionManager.interactBlock(player, Hand.MAIN_HAND, bhr);
+                if (res.isAccepted()) {
+                    pillarPos = front;
+                    stateTicks = 0;
+                    StateCollector.addBehaviorLog("寻路垫脚: 放置 " + front.toShortString());
+                    return false;
+                }
+            }
+            // 放置失败（悬崖/低洼等）：放弃垫脚
+            StateCollector.addBehaviorLog("寻路垫脚: 放置失败");
+            state = NAV;
+            return false;
+        }
+
+        private void startPillar(MinecraftClient client, ClientPlayerEntity player) {
+            state = PILLAR;
+            stateTicks = 0;
+            pillarPos = null;
+            client.options.attackKey.setPressed(false);
+            client.options.jumpKey.setPressed(false);
+            client.options.forwardKey.setPressed(false);
+        }
+
+        private void endPillar(MinecraftClient client, ClientPlayerEntity player) {
+            client.options.forwardKey.setPressed(false);
+            client.options.jumpKey.setPressed(false);
+            pillarPos = null;
+            pillarJumped = false;
+            state = NAV;
+            path = null;   // 玩家位置已变，强制重新规划
+            stuckCount = 0;
+            lastCheckX = player.getX();
+            lastCheckZ = player.getZ();
+            checkCounter = 0;
         }
 
         /** 挖掘障碍子状态：锁定瞄准目标方块并持续挖掘，直到方块被破坏 */
@@ -735,6 +960,8 @@ public class ActionExecutor {
             stateTicks = 0;
             targetObstacle = obstacle;
             client.options.jumpKey.setPressed(false);
+            // 自动切换更合适的工具
+            ensureBestTool(player, player.getWorld().getBlockState(obstacle));
             client.options.attackKey.setPressed(true);
             double dx = obstacle.getX() + 0.5 - player.getX();
             double dy = obstacle.getY() + 0.5
@@ -830,6 +1057,184 @@ public class ActionExecutor {
             }
         }
     }
+    /**
+     * 分层 BFS 路径规划：在玩家周围搜索一条可站立行走的路径（自动绕开障碍/台阶/坑）。
+     * 节点 = 玩家脚部站立位置，允许跳上 1 格台阶；找不到时返回 null（调用方直线兜底）。
+     */
+    private static List<BlockPos> findPath(ClientPlayerEntity player, double tx, double ty, double tz) {
+        World world = player.getWorld();
+        BlockPos start = player.getBlockPos();
+        BlockPos goal = new BlockPos((int) Math.floor(tx), (int) Math.floor(ty), (int) Math.floor(tz));
+        int range = 48;
+        if (Math.abs(goal.getX() - start.getX()) > range || Math.abs(goal.getZ() - start.getZ()) > range) {
+            return null;
+        }
+        if (!isStandable(world, start)) return null;
+
+        Deque<BlockPos> queue = new ArrayDeque<>();
+        Map<BlockPos, BlockPos> cameFrom = new HashMap<>();
+        Set<BlockPos> visited = new HashSet<>();
+        queue.add(start);
+        visited.add(start);
+        int maxNodes = 24000;
+
+        int[] dx = {1, -1, 0, 0};
+        int[] dz = {0, 0, 1, -1};
+
+        BlockPos found = null;
+        while (!queue.isEmpty() && cameFrom.size() < maxNodes) {
+            BlockPos cur = queue.poll();
+            // 到达判定：水平 ≤1 格、垂直差 ≤2 格
+            if (Math.abs(cur.getX() - goal.getX()) <= 1
+                    && Math.abs(cur.getZ() - goal.getZ()) <= 1
+                    && Math.abs(cur.getY() - goal.getY()) <= 2) {
+                found = cur;
+                break;
+            }
+            for (int d = 0; d < 4; d++) {
+                int nx = cur.getX() + dx[d];
+                int nz = cur.getZ() + dz[d];
+                // 从同高度到 +1 层找站立点（走下不主动规划，玩家会自然下落）
+                for (int dy = 0; dy <= 1; dy++) {
+                    BlockPos cand = new BlockPos(nx, cur.getY() + dy, nz);
+                    if (cand.getY() < world.getBottomY() + 1 || cand.getY() > world.getTopY()) continue;
+                    if (isStandable(world, cand) && visited.add(cand)) {
+                        queue.add(cand);
+                        cameFrom.put(cand, cur);
+                        break;
+                    }
+                }
+            }
+        }
+        if (found == null) return null;
+
+        // 回溯路径（不含起点）
+        List<BlockPos> path = new ArrayList<>();
+        BlockPos cur = found;
+        while (cur != null && !cur.equals(start)) {
+            path.add(0, cur);
+            cur = cameFrom.get(cur);
+        }
+        return path;
+    }
+
+    /** 玩家脚部可站立在该位置：脚下有支撑、身体空间（本格+上方 1 格）非固体 */
+    private static boolean isStandable(World world, BlockPos pos) {
+        if (!isSolid(world, pos) && !isSolid(world, pos.up())) {
+            return isSolid(world, pos.down());
+        }
+        return false;
+    }
+
+    /** 是否实心方块（可站立/阻挡的完整固体，如石头/泥土/原木） */
+    private static boolean isSolid(World world, BlockPos pos) {
+        BlockState s = world.getBlockState(pos);
+        if (s.isAir()) return false;
+        return s.isSolidBlock(world, pos);
+    }
+
+    /** 从背包找一个能当垫脚的方块槽位（优先手持/快捷栏，其次背包并交换到快捷栏） */
+    private static int findPillarSlot(MinecraftClient client, ClientPlayerEntity player) {
+        PlayerInventory inv = player.getInventory();
+        // 1) 当前手持
+        ItemStack held = player.getMainHandStack();
+        if (!held.isEmpty() && isPillarBlock(held)) {
+            return inv.selectedSlot;
+        }
+        // 2) 快捷栏 0-8
+        for (int i = 0; i < 9; i++) {
+            ItemStack stack = inv.getStack(i);
+            if (!stack.isEmpty() && isPillarBlock(stack)) {
+                return i;
+            }
+        }
+        // 3) 背包 9-35：交换到快捷栏 0
+        for (int i = 9; i < 36; i++) {
+            ItemStack stack = inv.getStack(i);
+            if (!stack.isEmpty() && isPillarBlock(stack)) {
+                inv.selectedSlot = 0;
+                client.interactionManager.pickFromInventory(i);
+                return 0;
+            }
+        }
+        return -1;
+    }
+
+    private static boolean isPillarBlock(ItemStack stack) {
+        if (!(stack.getItem() instanceof BlockItem)) return false;
+        Identifier id = Registries.ITEM.getId(stack.getItem());
+        String idPath = id != null ? id.getPath().toLowerCase() : "";
+        for (String k : NON_PILLAR_KEYWORDS) {
+            if (idPath.contains(k)) return false;
+        }
+        return true;
+    }
+
+    /**
+     * 挖掘前调用：确保手持背包中对目标方块最快的工具（镐/斧/锹等）。
+     * 快捷栏有更快工具时直接切换；背包（9-35）有更快工具时交换到快捷栏。
+     * 返回是否发生了切换。
+     */
+    private static boolean ensureBestTool(ClientPlayerEntity player, BlockState targetState) {
+        PlayerInventory inv = player.getInventory();
+        ItemStack held = player.getMainHandStack();
+        float heldSpeed = held.getMiningSpeedMultiplier(targetState);
+        int bestSlot = inv.selectedSlot;
+        float bestSpeed = heldSpeed;
+        for (int i = 0; i < 9; i++) {
+            ItemStack s = inv.getStack(i);
+            if (s.isEmpty()) continue;
+            float sp = s.getMiningSpeedMultiplier(targetState);
+            if (sp > bestSpeed) {
+                bestSpeed = sp;
+                bestSlot = i;
+            }
+        }
+        if (bestSlot != inv.selectedSlot) {
+            inv.selectedSlot = bestSlot;
+            StateCollector.addBehaviorLog("挖掘前自动切换到更合适的工具（槽位 " + bestSlot + "）");
+            return true;
+        }
+        // 快捷栏没有明显更快的：从背包找
+        if (bestSpeed <= 1.05f) {
+            for (int i = 9; i < 36; i++) {
+                ItemStack s = inv.getStack(i);
+                if (s.isEmpty()) continue;
+                float sp = s.getMiningSpeedMultiplier(targetState);
+                if (sp > 1.05f) {
+                    MinecraftClient.getInstance().interactionManager.pickFromInventory(i);
+                    StateCollector.addBehaviorLog("挖掘前从背包切换更合适的工具");
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** 水平搜索最近的露天出口（同层可站立且头顶 20 格连续空气），找不到返回 null */
+    private static BlockPos findOpenSkyExit(ClientPlayerEntity player, int range) {
+        World world = player.getWorld();
+        BlockPos playerPos = player.getBlockPos();
+        for (int radius = 1; radius <= range; radius++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    if (Math.abs(dx) != radius && Math.abs(dz) != radius) continue;
+                    BlockPos p = new BlockPos(playerPos.getX() + dx, playerPos.getY(), playerPos.getZ() + dz);
+                    if (!isStandable(world, p)) continue;
+                    boolean open = true;
+                    for (int y = p.getY() + 1; y < p.getY() + 20 && y < 320; y++) {
+                        if (!world.getBlockState(new BlockPos(p.getX(), y, p.getZ())).isAir()) {
+                            open = false;
+                            break;
+                        }
+                    }
+                    if (open) return p;
+                }
+            }
+        }
+        return null;
+    }
+
     /** 查找玩家正前方（行进方向）的阻挡方块：先查相邻脚部/身体高度，其次视线射线 */
     private static BlockPos findBlockInFront(ClientPlayerEntity player,
                                              double tx, double ty, double tz) {
@@ -921,23 +1326,27 @@ public class ActionExecutor {
                 "已标注 " + markedBlocks.size() + " 个相连方块(" + idPath + ")，调用 mc_digBlock 可连续挖完");
     }
 
-    // ======================== PlaceTask：放置（自动调整距离与视角） ========================
+    // ======================== PlaceTask：放置（自动调整距离、视角、放置后校验） ========================
 
     /**
-     * 放置方块。AI 导航到达目标后常紧贴目标方块且视角朝下（导航按视线朝目标移动），
-     * 导致放置距离不足或方向错误。本任务自动修正：
-     * 1) 与瞄准方块水平距离 < 1.6 格时自动后退到 1.8 格以上；
+     * 放置方块。自动修正三个常见失败原因：
+     * 1) 与瞄准方块水平距离 < 1.6 格时自动后退拉开距离（1.8 格以上）；
      * 2) 视角朝下超过 30° 时自动抬平；
-     * 然后重新瞄准并放置，回报详细结果。
+     * 3) 后退不动（狭小空间/身后有墙）时改为跳跃放置（跳起时让出脚下空间再放）；
+     * 放置后校验目标位置是否真的出现该方块，避免“假成功”让 AI 隔空操作。
      */
     private static class PlaceTask implements ActionTask {
-        private static final int PREP = 0, BACKUP = 1, PLACE = 2;
+        private static final int PREP = 0, BACKUP = 1, JUMP_ATTEMPT = 2, PLACE = 3, VERIFY = 4;
         private final long myVersion;
         private final long callId = currentCallId;
-        private BlockPos anchor = null;   // 初始瞄准的方块（放置参照）
+        private BlockPos anchor = null;      // 初始瞄准的方块（放置参照）
         private int state = PREP;
         private int stateTicks = 0;
         private int backupTicks = 0;
+        private double backupStartX = 0, backupStartZ = 0;
+        private BlockPos expectedPos = null; // 预期放置位置（用于校验）
+        private Block expectedBlock = null;  // 预期放置的方块（手持 BlockItem 时）
+        private String heldName = "";        // 手持物品名（结果报告用）
 
         PlaceTask() {
             this.myVersion = actionVersion;
@@ -946,7 +1355,7 @@ public class ActionExecutor {
         @Override
         public boolean tick(MinecraftClient client, ClientPlayerEntity player) {
             if (actionVersion != myVersion || navCancelled) {
-                client.options.backKey.setPressed(false);
+                releaseAllKeys(client);
                 return true;
             }
 
@@ -966,6 +1375,8 @@ public class ActionExecutor {
                         state = BACKUP;
                         stateTicks = 0;
                         backupTicks = 0;
+                        backupStartX = player.getX();
+                        backupStartZ = player.getZ();
                         return false;
                     }
                     state = PLACE;
@@ -989,17 +1400,58 @@ public class ActionExecutor {
                         stateTicks = 0;
                         return false;
                     }
-                    // 后退 1.5 秒仍拉不开距离（身后有墙）：直接尝试放置
+                    // 后退 1.5 秒：检查是否真的拉开了距离
                     if (backupTicks > 30) {
                         client.options.backKey.setPressed(false);
-                        state = PLACE;
+                        double moved = Math.abs(player.getX() - backupStartX)
+                                + Math.abs(player.getZ() - backupStartZ);
+                        if (moved < 0.3) {
+                            // 后退不动（狭小空间/身后有墙）：尝试跳跃放置
+                            StateCollector.addBehaviorLog("放置: 后退空间不足，尝试跳跃放置");
+                            state = JUMP_ATTEMPT;
+                        } else {
+                            state = PLACE;
+                        }
                         stateTicks = 0;
                         return false;
                     }
                     return false;
                 }
-                default: { // PLACE
-                    client.options.backKey.setPressed(false);
+                case JUMP_ATTEMPT: {
+                    stateTicks++;
+                    // 跳跃让出脚下空间，同时朝下 60° 瞄准，把方块放到脚前/脚下
+                    client.options.jumpKey.setPressed(true);
+                    double dx = anchor.getX() + 0.5 - player.getX();
+                    double dz = anchor.getZ() + 0.5 - player.getZ();
+                    player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+                    player.setPitch(60f);
+                    if (stateTicks >= 4 && stateTicks <= 12 && stateTicks % 3 == 0) {
+                        HitResult hit = player.raycast(3.0, 0, false);
+                        if (hit.getType() == HitResult.Type.BLOCK) {
+                            ActionResult res = client.interactionManager.interactBlock(
+                                    player, Hand.MAIN_HAND, (BlockHitResult) hit);
+                            if (res.isAccepted()) {
+                                recordExpected(player, (BlockHitResult) hit);
+                            }
+                        }
+                    }
+                    if (stateTicks > 14) {
+                        client.options.jumpKey.setPressed(false);
+                        if (expectedPos == null) {
+                            // 跳跃放置也没成功（周围空间不足）
+                            sendResult("place", callId, false,
+                                    "放置失败：周围空间不足（后退不动、跳跃放置也未生效）。"
+                                            + "建议先挖掉周围方块腾出空间，或换个位置再试。");
+                            return true;
+                        }
+                        state = VERIFY;
+                        stateTicks = 0;
+                        return false;
+                    }
+                    return false;
+                }
+                case PLACE: {
+                    releaseAllKeys(client);
                     HitResult hit = player.raycast(5.0, 0, false);
                     if (hit.getType() != HitResult.Type.BLOCK) {
                         sendResult("place", callId, false,
@@ -1008,20 +1460,53 @@ public class ActionExecutor {
                     }
                     ActionResult res = client.interactionManager.interactBlock(
                             player, Hand.MAIN_HAND, (BlockHitResult) hit);
-                    String heldName = player.getMainHandStack().isEmpty()
+                    heldName = player.getMainHandStack().isEmpty()
                             ? "空手" : player.getMainHandStack().getItem().getName().getString();
                     if (res.isAccepted()) {
-                        sendResult("place", callId, true, "已放置 " + heldName);
+                        recordExpected(player, (BlockHitResult) hit);
+                        state = VERIFY;
+                        stateTicks = 0;
                     } else {
                         sendResult("place", callId, false,
                                 "放置失败，建议后退到 2-3 格外并保持水平视角再试（也可用 mc_look 先看向目标位置）");
+                        return true;
+                    }
+                    return false;
+                }
+                default: { // VERIFY：放置后校验目标位置是否真的出现该方块
+                    stateTicks++;
+                    if (stateTicks < 6) return false;   // 等 0.3 秒让方块出现
+                    boolean ok;
+                    if (expectedBlock != null && expectedPos != null) {
+                        ok = player.getWorld().getBlockState(expectedPos).getBlock() == expectedBlock;
+                    } else {
+                        ok = true;  // 非方块物品（如桶/火把等），以 accepted 为准
+                    }
+                    if (ok) {
+                        sendResult("place", callId, true, "已放置 " + heldName);
+                    } else {
+                        sendResult("place", callId, false,
+                                "放置未生效：目标位置 " + expectedPos.toShortString() + " 没有出现 "
+                                        + heldName + "（可能是距离太近/空间不足/朝向不对）。"
+                                        + "建议：后退 2-3 格保持水平视角，或先挖掉周围方块腾出空间，再重试。");
                     }
                     return true;
                 }
             }
         }
-    }
 
+        /** 记录预期放置位置与方块（用于 VERIFY 校验） */
+        private void recordExpected(ClientPlayerEntity player, BlockHitResult hit) {
+            expectedPos = hit.getBlockPos().offset(hit.getSide());
+            ItemStack held = player.getMainHandStack();
+            heldName = held.isEmpty() ? "空手" : held.getItem().getName().getString();
+            if (held.getItem() instanceof BlockItem bi) {
+                expectedBlock = bi.getBlock();
+            } else {
+                expectedBlock = null;
+            }
+        }
+    }
     // ======================== DigBlockTask：持续挖掘 ========================
 
     private static class DigBlockTask implements ActionTask {
@@ -1064,6 +1549,8 @@ public class ActionExecutor {
                 System.out.println("[MC-Control] Digging " +
                         targetBlockName + " at " + targetPos.toShortString());
                 initialized = true;
+                // 自动切换更合适的工具（镐/斧/锹）
+                ensureBestTool(player, s);
                 client.options.attackKey.setPressed(true);
                 return false;
             }
@@ -1179,6 +1666,8 @@ public class ActionExecutor {
                 }
                 case MINE: {
                     stateTicks++;
+                    // 自动切换更合适的工具（每 tick 检测开销极小，可应对捡到新工具）
+                    ensureBestTool(player, player.getWorld().getBlockState(target));
                     if (player.getWorld().getBlockState(target).isAir()) {
                         client.options.attackKey.setPressed(false);
                         if (markedBlocks.remove(target)) {
@@ -1420,41 +1909,6 @@ public class ActionExecutor {
         }
 
         /** 从背包找一个能当垫脚的方块槽位（优先手持/快捷栏，其次背包并交换到快捷栏） */
-        private int findPillarSlot(MinecraftClient client, ClientPlayerEntity player) {
-            PlayerInventory inv = player.getInventory();
-            // 1) 当前手持
-            ItemStack held = player.getMainHandStack();
-            if (!held.isEmpty() && isPillarBlock(held)) {
-                return inv.selectedSlot;
-            }
-            // 2) 快捷栏 0-8
-            for (int i = 0; i < 9; i++) {
-                ItemStack stack = inv.getStack(i);
-                if (!stack.isEmpty() && isPillarBlock(stack)) {
-                    return i;
-                }
-            }
-            // 3) 背包 9-35：交换到快捷栏 0
-            for (int i = 9; i < 36; i++) {
-                ItemStack stack = inv.getStack(i);
-                if (!stack.isEmpty() && isPillarBlock(stack)) {
-                    inv.selectedSlot = 0;
-                    client.interactionManager.pickFromInventory(i);
-                    return 0;
-                }
-            }
-            return -1;
-        }
-
-        private boolean isPillarBlock(ItemStack stack) {
-            if (!(stack.getItem() instanceof BlockItem)) return false;
-            Identifier id = Registries.ITEM.getId(stack.getItem());
-            String idPath = id != null ? id.getPath().toLowerCase() : "";
-            for (String k : NON_PILLAR_KEYWORDS) {
-                if (idPath.contains(k)) return false;
-            }
-            return true;
-        }
     }
 
     // ======================== DigDownTask：安全向下挖 ========================
@@ -1496,7 +1950,8 @@ public class ActionExecutor {
                         sendResult("dig_down", callId, false, "遇到危险: " + name);
                         return true;
                     }
-                    // 向下看并按住挖掘键
+                    // 向下看并按住挖掘键（自动切工具）
+                    ensureBestTool(player, state);
                     player.setPitch(90f);
                     client.options.attackKey.setPressed(true);
                     phaseTicks = 0;
@@ -1536,10 +1991,27 @@ public class ActionExecutor {
 
     // ======================== GoToSurfaceTask：向上挖回地面 ========================
 
+    /**
+     * 回到地面：不再死磕直线向上挖。
+     * 1) 优先水平寻找最近的露天出口（半径 20 格内头顶通天的位置），走过去再向上挖；
+     * 2) 没有出口时向上挖，但挖到不可挖掘方块（基岩/黑曜石）3 秒挖不动时自动水平换位；
+     * 3) 水平移动被墙挡住时自动挖掉阻挡方块。
+     */
     private static class GoToSurfaceTask implements ActionTask {
         private final long myVersion;
         private final long callId = currentCallId;
         private int phaseTicks = 0;
+        private int recheckTicks = 0;
+        private BlockPos exitPos = null;      // 找到的露天出口（水平移动目标）
+        private boolean digging = false;      // 是否正在挖路径障碍
+        private BlockPos digTarget = null;
+        private int digStuckTicks = 0;
+        private double lastCheckX = 0, lastCheckZ = 0;
+        private int checkCounter = 0;
+        private int stuckCount = 0;
+        private int moveTicks = 0;            // 挖不动时水平换位的剩余 tick
+        private float moveYaw = 0;            // 水平换位的方向
+        private BlockPos lastDigPos = null;   // 最近一次尝试挖的头顶方块（检测挖不动）
 
         GoToSurfaceTask() {
             this.myVersion = actionVersion;
@@ -1547,36 +2019,152 @@ public class ActionExecutor {
 
         @Override
         public boolean tick(MinecraftClient client, ClientPlayerEntity player) {
-            if (actionVersion != myVersion || navCancelled) return true;
+            if (actionVersion != myVersion || navCancelled) {
+                releaseAllKeys(client);
+                return true;
+            }
 
             BlockPos pos = player.getBlockPos();
             // 已露天（头顶连续 air）则完成
             if (isOpenSky(player, pos)) {
+                releaseAllKeys(client);
                 sendResult("go_to_surface", callId, true, "已回到地面");
                 return true;
             }
 
+            // 挖不动时的水平换位（基岩等）: 朝随机方向走 3 秒
+            if (moveTicks > 0) {
+                moveTicks--;
+                player.setYaw(moveYaw);
+                player.setPitch(0);
+                client.options.forwardKey.setPressed(true);
+                client.options.attackKey.setPressed(false);
+                phaseTicks++;
+                return false;
+            }
+
+            // 定期重新搜索露天出口（每 2 秒）
+            recheckTicks--;
+            if (exitPos == null || recheckTicks <= 0) {
+                exitPos = findOpenSkyExit(player, 20);
+                recheckTicks = 40;
+                if (exitPos != null) {
+                    StateCollector.addBehaviorLog("找到露天出口 " + exitPos.toShortString() + "，先走过去");
+                }
+            }
+
+            // ---- 有出口：水平移动过去（走通道/挖穿薄墙）----
+            if (exitPos != null) {
+                double dx = exitPos.getX() + 0.5 - player.getX();
+                double dz = exitPos.getZ() + 0.5 - player.getZ();
+                double hDist = Math.sqrt(dx * dx + dz * dz);
+                if (hDist < 2.5) {
+                    // 到出口下方：转向上方挖
+                    exitPos = null;
+                    phaseTicks = 0;
+                } else {
+                    // 挖掘路径障碍中：锁定视角到障碍直到挖穿
+                    if (digging && digTarget != null) {
+                        double ox = digTarget.getX() + 0.5 - player.getX();
+                        double oy = digTarget.getY() + 0.5
+                                - (player.getY() + player.getEyeHeight(player.getPose()));
+                        double oz = digTarget.getZ() + 0.5 - player.getZ();
+                        player.setYaw((float) Math.toDegrees(Math.atan2(-ox, oz)));
+                        player.setPitch((float) Math.toDegrees(-Math.atan2(oy, Math.sqrt(ox * ox + oz * oz))));
+                        client.options.forwardKey.setPressed(true);
+                        client.options.attackKey.setPressed(true);
+                        digStuckTicks++;
+                        if (player.getWorld().getBlockState(digTarget).isAir() || digStuckTicks > 100) {
+                            digging = false;
+                            digTarget = null;
+                            client.options.attackKey.setPressed(false);
+                            digStuckTicks = 0;
+                        }
+                        phaseTicks++;
+                        return false;
+                    }
+                    // 正常朝出口走
+                    player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+                    player.setPitch(0);
+                    client.options.forwardKey.setPressed(true);
+                    client.options.attackKey.setPressed(false);
+                    if (phaseTicks % 20 < 4) {
+                        client.options.jumpKey.setPressed(true);
+                    } else {
+                        client.options.jumpKey.setPressed(false);
+                    }
+                    // 卡住检测 → 挖前方障碍
+                    checkCounter++;
+                    if (checkCounter >= 10) {
+                        double moved = Math.abs(player.getX() - lastCheckX)
+                                + Math.abs(player.getZ() - lastCheckZ);
+                        if (moved < 0.15) {
+                            stuckCount++;
+                        } else {
+                            stuckCount = 0;
+                        }
+                        lastCheckX = player.getX();
+                        lastCheckZ = player.getZ();
+                        checkCounter = 0;
+                    }
+                    if (stuckCount >= 2) {
+                        stuckCount = 0;
+                        BlockPos ob = findBlockInFront(player,
+                                exitPos.getX() + 0.5, exitPos.getY() + 0.5, exitPos.getZ() + 0.5);
+                        if (ob != null && isBreakable(player, ob)) {
+                            digging = true;
+                            digTarget = ob;
+                            digStuckTicks = 0;
+                        } else {
+                            // 前方不可挖：放弃这个出口
+                            exitPos = null;
+                            client.options.jumpKey.setPressed(false);
+                        }
+                    }
+                    phaseTicks++;
+                    return false;
+                }
+            }
+
+            // ---- 向上挖 ----
+            phaseTicks++;
             BlockPos above = pos.up();
             BlockState aboveState = player.getWorld().getBlockState(above);
             player.setPitch(-90f);
 
             if (aboveState.isAir()) {
                 // 头顶是空气，跳跃上去
+                client.options.attackKey.setPressed(false);
                 client.options.jumpKey.setPressed(true);
                 client.options.forwardKey.setPressed(true);
-                phaseTicks++;
                 if (phaseTicks > 10) {
                     client.options.jumpKey.setPressed(false);
                     client.options.forwardKey.setPressed(false);
                     phaseTicks = 0;
                 }
             } else {
-                // 头顶有方块，挖掉
+                // 头顶有方块，挖掉（自动切工具）
+                ensureBestTool(player, aboveState);
                 client.options.attackKey.setPressed(true);
+                // 检测是否挖不动（基岩/黑曜石等）
+                if (above.equals(lastDigPos)) {
+                    digStuckTicks++;
+                } else {
+                    lastDigPos = above;
+                    digStuckTicks = 0;
+                }
+                if (digStuckTicks > 60) {
+                    // 3 秒挖不动：水平随机移动换位置
+                    client.options.attackKey.setPressed(false);
+                    digStuckTicks = 0;
+                    lastDigPos = null;
+                    moveTicks = 60;
+                    moveYaw = player.getYaw() + (float) (Math.random() * 240 - 120);
+                    StateCollector.addBehaviorLog("头顶方块挖不动，水平移动换位置");
+                }
                 if (player.getWorld().getBlockState(above).isAir()) {
                     client.options.attackKey.setPressed(false);
                     client.options.jumpKey.setPressed(true);
-                    phaseTicks++;
                     if (phaseTicks > 5) {
                         client.options.jumpKey.setPressed(false);
                         phaseTicks = 0;
@@ -1594,6 +2182,272 @@ public class ActionExecutor {
                 }
             }
             return true;
+        }
+    }
+    // ======================== FurnaceSmeltTask：熔炉/高炉/烟熏炉自动烧炼 ========================
+
+    /**
+     * 自动烧炼：解决 AI 无法使用熔炉的问题。
+     * 1) 靠近附近的熔炉并右键打开界面；
+     * 2) 用 shift-click 把背包中的原料批量放入输入槽(0)；
+     * 3) 放入燃料到燃料槽(1)（自动检测背包燃料，耗尽自动补充）；
+     * 4) 等待烧制完成，shift-click 取出产物，关闭界面并报告结果。
+     */
+    private static class FurnaceSmeltTask implements ActionTask {
+        private static final int FIND = 0, OPEN = 1, PUT_INPUT = 2, PUT_FUEL = 3,
+                SMELT = 4, TAKE = 5, DONE = 6;
+        private final long myVersion;
+        private final long callId = currentCallId;
+        private final RecipeLookup.RecipeInfo recipe;
+        private final BlockPos furnacePos;
+        private final String outputId;
+        private final int needInput;      // 需要的原料总数
+        private final String inputDisplay;
+        private final String furnaceDisplay;
+        private int phase = FIND;
+        private int phaseTicks = 0;
+        private int slotCooldown = 0;
+        private int putCount = 0;         // 连续点击计数（防止卡死）
+        private int inputInvSlot = -1;    // 原料在背包的槽位
+        private int fuelInvSlot = -1;     // 燃料在背包的槽位
+
+        FurnaceSmeltTask(RecipeLookup.RecipeInfo recipe, int count, BlockPos furnacePos) {
+            this.myVersion = actionVersion;
+            this.recipe = recipe;
+            this.furnacePos = furnacePos;
+            this.outputId = recipe.outputItemId.contains(":")
+                    ? recipe.outputItemId.substring(recipe.outputItemId.indexOf(':') + 1)
+                    : recipe.outputItemId;
+            List<RecipeLookup.RequiredIngredient> req = RecipeLookup.getRequiredIngredients(recipe);
+            int per = 1;
+            for (RecipeLookup.RequiredIngredient r : req) per = Math.max(per, r.count);
+            this.needInput = Math.max(1, per * count);
+            this.inputDisplay = req.isEmpty() ? "原料" : req.get(0).displayName;
+            if ("blasting".equals(recipe.type)) this.furnaceDisplay = "高炉";
+            else if ("smoking".equals(recipe.type)) this.furnaceDisplay = "烟熏炉";
+            else this.furnaceDisplay = "熔炉";
+        }
+
+        @Override
+        public boolean tick(MinecraftClient client, ClientPlayerEntity player) {
+            if (actionVersion != myVersion || navCancelled) {
+                releaseAllKeys(client);
+                player.closeHandledScreen();
+                return true;
+            }
+            if (slotCooldown > 0) slotCooldown--;
+
+            switch (phase) {
+                case FIND: {   // 靠近熔炉并打开界面
+                    phaseTicks++;
+                    double dx = furnacePos.getX() + 0.5 - player.getX();
+                    double dz = furnacePos.getZ() + 0.5 - player.getZ();
+                    double hDist = Math.sqrt(dx * dx + dz * dz);
+                    player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+                    player.setPitch(0);
+                    if (hDist > 3.2) {
+                        client.options.forwardKey.setPressed(true);
+                        if (phaseTicks > 200) {   // 10 秒走不到：放弃
+                            client.options.forwardKey.setPressed(false);
+                            sendResult("craft", callId, false,
+                                    "无法靠近" + furnaceDisplay + "（" + furnacePos.toShortString()
+                                            + "），请先走到炉子旁边再调用 mc_craft");
+                            return true;
+                        }
+                        return false;
+                    }
+                    client.options.forwardKey.setPressed(false);
+                    if (player.currentScreenHandler instanceof AbstractFurnaceScreenHandler) {
+                        phase = PUT_INPUT;
+                        phaseTicks = 0;
+                        return false;
+                    }
+                    Vec3d hitPos = new Vec3d(furnacePos.getX() + 0.5,
+                            furnacePos.getY() + 0.5, furnacePos.getZ() + 0.5);
+                    BlockHitResult bhr = new BlockHitResult(hitPos, Direction.UP, furnacePos, false);
+                    client.interactionManager.interactBlock(player, Hand.MAIN_HAND, bhr);
+                    phase = OPEN;
+                    phaseTicks = 0;
+                    return false;
+                }
+                case OPEN: {   // 等待界面打开
+                    phaseTicks++;
+                    if (player.currentScreenHandler instanceof AbstractFurnaceScreenHandler) {
+                        phase = PUT_INPUT;
+                        phaseTicks = 0;
+                        return false;
+                    }
+                    if (phaseTicks > 40) {
+                        sendResult("craft", callId, false, "打开" + furnaceDisplay + "界面超时，请检查炉子位置");
+                        return true;
+                    }
+                    return false;
+                }
+                case PUT_INPUT: {
+                    phaseTicks++;
+                    if (slotCooldown > 0) return false;
+                    if (!(player.currentScreenHandler instanceof AbstractFurnaceScreenHandler handler)) {
+                        phase = FIND;   // 界面丢了：重新打开
+                        phaseTicks = 0;
+                        return false;
+                    }
+                    int cur = handler.getSlot(0).getStack().getCount();
+                    if (cur >= needInput) {
+                        phase = PUT_FUEL;
+                        phaseTicks = 0;
+                        putCount = 0;
+                        return false;
+                    }
+                    if (inputInvSlot < 0) {
+                        inputInvSlot = findSmeltInputSlot(player);
+                        if (inputInvSlot < 0) {
+                            sendResult("craft", callId, false,
+                                    "背包中没有烧炼原料: " + inputDisplay + "（需要 " + needInput + " 个）");
+                            player.closeHandledScreen();
+                            return true;
+                        }
+                    }
+                    // shift-click 把原料批量放入输入槽
+                    client.interactionManager.clickSlot(handler.syncId,
+                            screenSlotOf(inputInvSlot), 0, SlotActionType.QUICK_MOVE, player);
+                    slotCooldown = 3;
+                    if (++putCount >= 12) {
+                        sendResult("craft", callId, false,
+                                "原料无法放入" + furnaceDisplay + "，请检查原料是否正确（" + inputDisplay + "）");
+                        player.closeHandledScreen();
+                        return true;
+                    }
+                    return false;
+                }
+                case PUT_FUEL: {
+                    phaseTicks++;
+                    if (slotCooldown > 0) return false;
+                    if (!(player.currentScreenHandler instanceof AbstractFurnaceScreenHandler handler)) {
+                        phase = FIND;
+                        phaseTicks = 0;
+                        return false;
+                    }
+                    // 燃料槽已有燃料或正在燃烧：开始等待
+                    if (!handler.getSlot(1).getStack().isEmpty() || handler.isBurning()) {
+                        phase = SMELT;
+                        phaseTicks = 0;
+                        putCount = 0;
+                        return false;
+                    }
+                    if (fuelInvSlot < 0) {
+                        fuelInvSlot = findFuelSlot(player);
+                        if (fuelInvSlot < 0) {
+                            sendResult("craft", callId, false,
+                                    "背包中没有燃料（煤炭/木炭/木板/原木等）。请先收集燃料再烧炼。");
+                            player.closeHandledScreen();
+                            return true;
+                        }
+                    }
+                    client.interactionManager.clickSlot(handler.syncId,
+                            screenSlotOf(fuelInvSlot), 0, SlotActionType.QUICK_MOVE, player);
+                    slotCooldown = 3;
+                    if (++putCount >= 12) {
+                        sendResult("craft", callId, false, "燃料无法放入" + furnaceDisplay);
+                        player.closeHandledScreen();
+                        return true;
+                    }
+                    return false;
+                }
+                case SMELT: {   // 等待烧制完成
+                    phaseTicks++;
+                    if (!(player.currentScreenHandler instanceof AbstractFurnaceScreenHandler handler)) {
+                        sendResult("craft", callId, false, furnaceDisplay + "界面意外关闭");
+                        return true;
+                    }
+                    // 输出槽有产物：取出
+                    if (!handler.getSlot(2).getStack().isEmpty()) {
+                        phase = TAKE;
+                        phaseTicks = 0;
+                        return false;
+                    }
+                    // 燃料耗尽且还没有产物：自动补燃料
+                    if (handler.getSlot(1).getStack().isEmpty()
+                            && !handler.getSlot(0).getStack().isEmpty()
+                            && phaseTicks % 60 == 0) {
+                        fuelInvSlot = findFuelSlot(player);
+                        if (fuelInvSlot >= 0) {
+                            client.interactionManager.clickSlot(handler.syncId,
+                                    screenSlotOf(fuelInvSlot), 0, SlotActionType.QUICK_MOVE, player);
+                            slotCooldown = 3;
+                            StateCollector.addBehaviorLog("熔炉燃料耗尽，自动补充");
+                        } else {
+                            sendResult("craft", callId, false,
+                                    "燃料烧完了且背包没有燃料，已停止烧炼");
+                            player.closeHandledScreen();
+                            return true;
+                        }
+                    }
+                    // 超时 120 秒
+                    if (phaseTicks > 2400) {
+                        sendResult("craft", callId, false, "烧炼超时，请检查" + furnaceDisplay + "是否有燃料");
+                        player.closeHandledScreen();
+                        return true;
+                    }
+                    return false;
+                }
+                case TAKE: {
+                    phaseTicks++;
+                    if (slotCooldown > 0) return false;
+                    if (!(player.currentScreenHandler instanceof AbstractFurnaceScreenHandler handler)) {
+                        phase = FIND;
+                        phaseTicks = 0;
+                        return false;
+                    }
+                    client.interactionManager.clickSlot(handler.syncId, 2, 0, SlotActionType.QUICK_MOVE, player);
+                    slotCooldown = 2;
+                    phase = DONE;
+                    phaseTicks = 0;
+                    return false;
+                }
+                default: { // DONE
+                    phaseTicks++;
+                    if (phaseTicks > 6) {
+                        player.closeHandledScreen();
+                        int have = countItemByIngredient(player.getInventory(), Set.of(outputId));
+                        sendResult("craft", callId, true,
+                                "烧炼成功: " + outputId + "（背包现有 " + have + " 个）");
+                        return true;
+                    }
+                    return false;
+                }
+            }
+        }
+
+        /** 从背包找烧炼原料槽位（匹配配方输入） */
+        private int findSmeltInputSlot(ClientPlayerEntity player) {
+            List<RecipeLookup.RequiredIngredient> req = RecipeLookup.getRequiredIngredients(recipe);
+            if (req.isEmpty()) return -1;
+            Set<String> matchIds = req.get(0).matchIds;
+            PlayerInventory inv = player.getInventory();
+            for (int i = 0; i < 36; i++) {
+                ItemStack s = inv.getStack(i);
+                if (s.isEmpty()) continue;
+                Identifier id = Registries.ITEM.getId(s.getItem());
+                if (id != null && matchIds.contains(id.getPath())) return i;
+            }
+            return -1;
+        }
+
+        /** 从背包找燃料槽位（煤炭/木炭/木板/原木等，按原版燃料时间判断） */
+        private int findFuelSlot(ClientPlayerEntity player) {
+            PlayerInventory inv = player.getInventory();
+            for (int i = 0; i < 36; i++) {
+                ItemStack s = inv.getStack(i);
+                if (s.isEmpty()) continue;
+                if (s.getItem().getFuelTime() > 0) return i;
+            }
+            return -1;
+        }
+
+        /** 背包槽位 → 熔炉界面屏幕槽位 */
+        private int screenSlotOf(int invSlot) {
+            if (invSlot < 9) return invSlot + 30;   // 快捷栏 0-8 → 30-38
+            return invSlot - 9 + 3;                 // 背包 9-35 → 3-29
         }
     }
 
@@ -2159,6 +3013,47 @@ public class ActionExecutor {
     // ======================== 合成（服务端同步） ========================
 
     /**
+     * 尝试用熔炼配方自动烧制：原料足够时找附近熔炉并启动 FurnaceSmeltTask。
+     * 返回 true 表示已处理（启动了任务或返回了明确提示）。
+     */
+    private static boolean trySmeltRecipe(MinecraftClient client, ClientPlayerEntity player,
+                                          List<RecipeLookup.RecipeInfo> allRecipes, int count) {
+        RecipeLookup.RecipeInfo cook = null;
+        for (RecipeLookup.RecipeInfo r : allRecipes) {
+            if ("smelting".equals(r.type) || "blasting".equals(r.type) || "smoking".equals(r.type)) {
+                List<RecipeLookup.RequiredIngredient> req = RecipeLookup.getRequiredIngredients(r);
+                boolean hasAll = true;
+                for (RecipeLookup.RequiredIngredient ing : req) {
+                    if (countItemByIngredient(player.getInventory(), ing.matchIds) < ing.count) {
+                        hasAll = false;
+                        break;
+                    }
+                }
+                if (hasAll) {
+                    cook = r;
+                    break;
+                }
+            }
+        }
+        if (cook == null) return false;
+
+        String furnaceType = "smelting".equals(cook.type) ? "furnace"
+                : ("blasting".equals(cook.type) ? "blast_furnace" : "smoker");
+        BlockPos furnacePos = findNearestBlock(player, furnaceType, 8);
+        if (furnacePos == null) {
+            sendResult("craft", false,
+                    "该物品需要通过" + ("smelting".equals(cook.type) ? "熔炉"
+                            : ("blasting".equals(cook.type) ? "高炉" : "烟熏炉"))
+                            + "烧炼（烧炼原料已就绪），但附近没有找到。"
+                            + "请先放置一个（mc_place " + furnaceType + "），然后再次调用 mc_craft。");
+            return true;
+        }
+        StateCollector.addBehaviorLog("检测到熔炼配方，使用" + furnaceType + "自动烧制");
+        startTask(client, new FurnaceSmeltTask(cook, count, furnacePos), "craft");
+        return true;
+    }
+
+    /**
      * 自动合成物品。使用 RecipeLookup 动态查询所有配方，
      * 逐个尝试直到找到材料足够的配方，然后通过 ScreenHandler 进行服务端同步合成。
      * 不再直接修改客户端背包，而是通过 clickRecipe + clickSlot 发送合成数据包给服务端。
@@ -2195,8 +3090,11 @@ public class ActionExecutor {
 
         if (craftableRecipes.isEmpty()) {
             if (hasCookingRecipe) {
+                // 材料足够时自动用熔炉/高炉/烟熏炉烧制
+                if (trySmeltRecipe(client, player, allRecipes, count)) return;
                 sendResult("craft", false,
-                    "该物品只能通过熔炼获得，不能用工作台合成。"
+                    "该物品只能通过熔炼获得，不能用工作台合成，"
+                    + "且背包中没有对应的烧炼原料。"
                     + "需要使用熔炉/高炉/烟熏炉，并放入燃料。");
             } else {
                 sendResult("craft", false, "未找到可用的合成台配方。可用 mc_queryRecipe 查看所有配方。");
@@ -2230,11 +3128,18 @@ public class ActionExecutor {
         }
 
         if (selected == null) {
+            // 所有合成台配方材料都不足：如果有熔炼配方且原料足够，自动改用熔炉烧制
+            if (hasCookingRecipe && trySmeltRecipe(client, player, allRecipes, count)) {
+                return;
+            }
             // 所有配方材料都不足
             StringBuilder sb = new StringBuilder("材料不足，已尝试全部 ");
-            sb.append(craftableRecipes.size()).append(" 个配方均无法合成。");
+            sb.append(craftableRecipes.size()).append(" 个合成台配方均无法合成。");
             sb.append("缺少的材料: ");
             sb.append(String.join("; ", missingInfo));
+            if (hasCookingRecipe) {
+                sb.append("。该物品也可通过熔炼获得（需要熔炉+燃料+对应原料），可用 mc_queryRecipe 查看。");
+            }
             sb.append("。可用 mc_queryRecipe 查看所有配方和所需材料。");
             sendResult("craft", false, sb.toString());
             return;
@@ -2275,6 +3180,25 @@ public class ActionExecutor {
 
         List<RecipeLookup.RecipeInfo> recipes = RecipeLookup.findRecipes(itemId);
         String result = RecipeLookup.formatRecipeResults(itemId, recipes);
+        // 查询的是炉子本身时，附加烧炼用法提示（避免 AI 把"制作熔炉"误当"烧炼方法"）
+        String lower = itemId.toLowerCase();
+        if (lower.equals("furnace") || lower.equals("blast_furnace") || lower.equals("smoker")) {
+            String display = lower.equals("blast_furnace") ? "高炉"
+                    : (lower.equals("smoker") ? "烟熏炉" : "熔炉");
+            result += "
+
+【提示】以上是制作" + display + "的方法。"
+                    + "若你想烧炼物品（如 raw_iron → iron_ingot、铁矿石 → 铁锭），"
+                    + "请查询目标产物（如 mc_queryRecipe iron_ingot），"
+                    + "然后在附近放置炉子后直接调用 mc_craft。";
+        } else if (lower.equals("iron_ingot") || lower.equals("gold_ingot")) {
+            result += "
+
+【提示】铁锭/金锭通常有两种途径："
+                    + "① 熔炉烧炼（矿石/粗金属 + 燃料，需要熔炉）；"
+                    + "② 工作台合成（铁粒/铁块分解）。"
+                    + "如果你有粗铁/铁矿石，请先放置熔炉（mc_place furnace）再调用 mc_craft。";
+        }
         boolean success = !recipes.isEmpty();
         sendResult("query_recipe", success, result);
     }

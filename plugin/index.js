@@ -27,6 +27,8 @@ class MCControlPlugin extends Plugin {
         // #6: 多 pending 调用管理
         this._callCounter = 0;
         this._pendingCalls = new Map(); // callId -> { resolve, timer, action }
+        // 防重复打断：超时后仍可能正在执行的 action 名 -> 过期时间戳（宽限期内重复调用直接提示）
+        this._busyActions = new Map(); // action -> expireTime
         // 诊断：是否收到过 mod 的 state 消息（区分"socket 已连接"和"真正能拿到游戏状态"）
         this._stateReceived = false;
         this._stateWarned = false;
@@ -158,18 +160,18 @@ class MCControlPlugin extends Plugin {
             { type: 'function', function: { name: 'mc_sneak', description: '潜行（蹲下）', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_unsneak', description: '取消潜行（站起来）', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_drop', description: '丢弃当前手持物品', parameters: { type: 'object', properties: {}, required: [] } } },
-            { type: 'function', function: { name: 'mc_goToBlock', description: '自动寻路到最近的指定方块。使用英文 ID（如 oak_log, stone, coal_ore）或中文名。状态里的 [minecraft:xxx] 就是 ID。若目标是原木/矿物（log/ore），会自动标注整棵树/整条矿脉的相连方块，之后调用 mc_digBlock 会一次挖完所有标注方块', parameters: { type: 'object', properties: { block_type: { type: 'string', description: '方块类型名称，如 oak_log, stone, coal_ore' }, range: { type: 'number', description: '搜索范围（格），默认 64', default: 64 } }, required: ['block_type'] } } },
+            { type: 'function', function: { name: 'mc_goToBlock', description: '自动寻路到最近的指定方块（自动规划路线绕开障碍、自动清理路径上的遮挡方块、目标太高自动垫脚、目标在地下自动向下挖）。使用英文 ID（如 oak_log, stone, coal_ore）或中文名。状态里的 [minecraft:xxx] 就是 ID。若目标是原木/矿物（log/ore），会自动标注整棵树/整条矿脉的相连方块，之后调用一次 mc_digBlock 会连续挖完所有标注方块', parameters: { type: 'object', properties: { block_type: { type: 'string', description: '方块类型名称，如 oak_log, stone, coal_ore' }, range: { type: 'number', description: '搜索范围（格），默认 64', default: 64 } }, required: ['block_type'] } } },
             { type: 'function', function: { name: 'mc_goToPos', description: '自动寻路到指定坐标', parameters: { type: 'object', properties: { x: { type: 'number', description: 'X 坐标' }, y: { type: 'number', description: 'Y 坐标' }, z: { type: 'number', description: 'Z 坐标' } }, required: ['x', 'y', 'z'] } } },
             { type: 'function', function: { name: 'mc_stopNav', description: '停止当前寻路', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_goal', description: '设定一个 Minecraft 任务目标，AI 会自动反复执行直到完成。完成后用 mc_goalDone 结束', parameters: { type: 'object', properties: { task: { type: 'string', description: '任务描述，如"收集 10 个橡木原木"' } }, required: ['task'] } } },
             { type: 'function', function: { name: 'mc_goalDone', description: '标记当前任务已完成', parameters: { type: 'object', properties: {}, required: [] } } },
-            { type: 'function', function: { name: 'mc_digBlock', description: '挖掘视线前方的方块直到破坏，自动捡掉落物。若之前 mc_goToBlock 标注过树/矿脉，会自动连续挖完所有标注方块：自动走向目标、自动挖掉路径遮挡、目标太高自动放置垫脚方块，直到全部挖完（超时会返回进度，可再次调用继续）', parameters: { type: 'object', properties: { timeout: { type: 'number', description: '超时时间（秒），默认 10（连续挖掘模式最长 90 秒）', default: 10 } }, required: [] } } },
+            { type: 'function', function: { name: 'mc_digBlock', description: '挖掘视线前方的方块直到破坏，自动切换更合适的工具（镐/斧/锹），自动捡掉落物。若之前 mc_goToBlock 标注过树/矿脉，会自动连续挖完所有标注方块：自动走向目标、自动挖掉路径遮挡、目标太高自动放置垫脚方块，直到全部挖完（超时会返回进度，可再次调用继续）', parameters: { type: 'object', properties: { timeout: { type: 'number', description: '超时时间（秒），默认 10（连续挖掘模式最长 90 秒）', default: 10 } }, required: [] } } },
             { type: 'function', function: { name: 'mc_digDown', description: '安全向下挖掘，会自动检测岩浆和水', parameters: { type: 'object', properties: { distance: { type: 'integer', description: '向下挖几格，默认 1', default: 1 } }, required: [] } } },
-            { type: 'function', function: { name: 'mc_goToSurface', description: '回到地面（向上挖）', parameters: { type: 'object', properties: {}, required: [] } } },
+            { type: 'function', function: { name: 'mc_goToSurface', description: '回到地面：自动寻找最近的露天出口走过去，找不到才向上挖，遇到挖不动的方块会自动换位置', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_attackEntity', description: '攻击最近的实体（怪物、动物等）', parameters: { type: 'object', properties: { type: { type: 'string', description: '实体类型，如 zombie, skeleton, cow。留空攻击任意' }, range: { type: 'number', description: '搜索范围，默认 16', default: 16 } }, required: [] } } },
             { type: 'function', function: { name: 'mc_equip', description: '装备物品（盔甲、盾牌等）', parameters: { type: 'object', properties: { item_name: { type: 'string', description: '物品名称，如 iron_chestplate, shield' } }, required: ['item_name'] } } },
             { type: 'function', function: { name: 'mc_consume', description: '吃食物或喝药水', parameters: { type: 'object', properties: { item_name: { type: 'string', description: '食物名称，如 bread, apple。留空自动吃任意食物' } }, required: [] } } },
-            { type: 'function', function: { name: 'mc_craft', description: '合成物品。动态查询游戏内所有配方并自动尝试每一个，找到材料足够的配方进行合成，支持所有已注册的配方（原版+模组）。当一个物品有多种配方时（如木棍可用木板或竹子合成），系统会逐个尝试直到找到材料足够的配方。传入要合成的物品 ID（如 oak_planks, crafting_table, wooden_pickaxe, iron_ingot, shield, torch 等），系统会自动查找配方、检查材料（支持标签匹配，如任意木板均可）并合成。合成操作通过服务端同步完成，不会出现回档问题。建议先用 mc_queryRecipe 查询配方了解需要什么材料', parameters: { type: 'object', properties: { recipe: { type: 'string', description: '要合成的物品 ID，如 oak_planks, crafting_table, wooden_pickaxe, iron_pickaxe, shield, torch, bread' }, count: { type: 'integer', description: '合成数量，默认 1', default: 1 } }, required: ['recipe'] } } },
+            { type: 'function', function: { name: 'mc_craft', description: '合成物品。动态查询游戏内所有配方并自动尝试每一个，找到材料足够的配方进行合成，支持所有已注册的配方（原版+模组）。当一个物品有多种配方时（如木棍可用木板或竹子合成），系统会逐个尝试直到找到材料足够的配方。传入要合成的物品 ID（如 oak_planks, crafting_table, wooden_pickaxe, iron_ingot, shield, torch 等），系统会自动查找配方、检查材料（支持标签匹配，如任意木板均可）并合成。如果是需要烧炼的物品（如 iron_ingot），会自动寻找附近熔炉，放入原料和燃料自动烧制并取出产物。合成操作通过服务端同步完成，不会出现回档问题。建议先用 mc_queryRecipe 查询配方了解需要什么材料', parameters: { type: 'object', properties: { recipe: { type: 'string', description: '要合成的物品 ID，如 oak_planks, crafting_table, wooden_pickaxe, iron_pickaxe, shield, torch, bread' }, count: { type: 'integer', description: '合成数量，默认 1', default: 1 } }, required: ['recipe'] } } },
             { type: 'function', function: { name: 'mc_queryRecipe', description: '查询任意物品的合成配方。返回所需的材料、合成站（工作台/熔炉/背包等）和摆放方式。类似 JEI 物品管理器的配方查询功能。用于了解合成某个物品需要什么材料、在什么条件下合成、怎么摆放。支持原版和模组配方', parameters: { type: 'object', properties: { item: { type: 'string', description: '要查询的物品 ID，如 oak_planks, iron_ingot, diamond_pickaxe, shield' } }, required: ['item'] } } },
             { type: 'function', function: { name: 'mc_status', description: '查询 Minecraft 连接状态和当前游戏信息', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_enableAuto', description: '启用自动行为模式（自卫、防饥饿、防卡、拾取等底层自动行为）', parameters: { type: 'object', properties: {}, required: [] } } },
@@ -379,6 +381,10 @@ class MCControlPlugin extends Plugin {
         patch += '\n\n【重要规则】控制 Minecraft 时必须且只能使用 mc_ 开头的工具。'
               + '\n禁止使用 execute_code、type_text、mouse_click、press_key 等工具模拟键盘鼠标操作。'
               + '\n所有游戏交互（移动、挖掘、合成、攻击等）都通过 mc_ 工具完成。'
+              + '\n\n【工具调用纪律】动作是串行执行的：一次只能执行一个工具，调用后必须等待结果返回再做下一步。'
+              + '\n绝对不要连续重复调用同一个工具（例如连续多次 mc_digBlock），那会互相打断导致失败。'
+              + '\n如果结果以 ⏳ 开头，说明上一个动作还在执行，请继续等待，不要重复调用。'
+              + '\n需要了解当前处境时调用 mc_look（会返回位置/视线/背包/周围方块），不要盲目操作。'
               + '\n\n【视角控制】mc_turn 的 pitch 参数：正值=向上看，负值=向下看（范围 -90 到 90）。'
               + '\n状态中显示的 pitch 也遵循此约定。'
               + '\n\n【合成系统】mc_craft 支持动态配方查询，可合成任何有配方的物品（不限于预设列表）。'
@@ -392,6 +398,24 @@ class MCControlPlugin extends Plugin {
     // ===== 动作执行结果反馈（#6: 多 pending 调用管理） =====
 
     async sendActionAndWait(action, customTimeout) {
+        // ---- 全串行化：一次只执行一个动作 ----
+        // 任何动作未完成时，只允许 mc_stopNav 打断；其他动作一律提示等待。
+        // 彻底避免 AI 短时间内连续调用工具，把正在执行的任务打断成"上一个任务已被新动作打断"
+        if (this._pendingCalls.size > 0) {
+            if (action.action !== 'stop_nav') {
+                const firstAction = [...this._pendingCalls.values()][0].action;
+                return '⏳ 上一个动作(' + firstAction + ')尚未完成，请等待它返回结果后再做下一步。'
+                    + '不要连续调用工具：每个工具调用后必须等待结果，动作会按顺序串行执行。';
+            }
+        }
+        // 上次调用超时但可能仍在执行（宽限期内）：同样不重发（stop_nav 除外）
+        const busyExpire = this._busyActions.get(action.action);
+        if (busyExpire && Date.now() < busyExpire) {
+            if (action.action !== 'stop_nav') {
+                return '⏳ ' + action.action + ' 可能仍在执行中（上次调用超时）。请稍等片刻再试，或先调用 mc_stopNav';
+            }
+        }
+
         let timeout = customTimeout || 10000;
         if (action.action === 'go_to_pos' || action.action === 'go_to_block') {
             timeout = 35000;
@@ -412,10 +436,13 @@ class MCControlPlugin extends Plugin {
             this.noCommandCount = 0;
 
             const timeoutHandle = setTimeout(() => {
-                // 超时：从 pending 移除并 resolve
+                // 超时：从 pending 移除并 resolve，同时登记"可能仍在执行"宽限期
                 if (this._pendingCalls.has(callId)) {
                     this._pendingCalls.delete(callId);
                 }
+                const longTask = ['go_to_pos', 'go_to_block', 'dig_block', 'dig_down',
+                        'go_to_surface', 'craft', 'query_recipe'].includes(action.action);
+                this._busyActions.set(action.action, Date.now() + (longTask ? 40000 : 15000));
                 resolve('⚠️ 动作执行超时，可能仍在进行中');
             }, timeout);
 
@@ -456,6 +483,7 @@ class MCControlPlugin extends Plugin {
 
         clearTimeout(pending.timer);
         this._pendingCalls.delete(key);
+        this._busyActions.delete(pending.action);
         this.noCommandCount = 0;
 
         const success = result.success !== false;

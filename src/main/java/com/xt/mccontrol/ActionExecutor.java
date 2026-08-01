@@ -644,7 +644,7 @@ public class ActionExecutor {
 
                 if (stuckCount >= 2) {
                     // 卡住 ≥1 秒：优先尝试挖掘正前方的阻挡方块
-                    BlockPos obstacle = findBlockInFront(player);
+                    BlockPos obstacle = findBlockInFront(player, tx, ty, tz);
                     if (obstacle != null) {
                         if (isBreakable(player, obstacle)) {
                             startDigging(client, player, obstacle);
@@ -781,7 +781,7 @@ public class ActionExecutor {
             // 绕行 4.5 秒无进展：若前方可挖则硬挖，否则回到导航强制进入挖掘评估
             if (stateTicks > 90) {
                 endBypass(client);
-                BlockPos obstacle = findBlockInFront(player);
+                BlockPos obstacle = findBlockInFront(player, tx, ty, tz);
                 if (obstacle != null && isBreakable(player, obstacle)) {
                     startDigging(client, player, obstacle);
                 } else {
@@ -812,23 +812,6 @@ public class ActionExecutor {
             StateCollector.addBehaviorLog("寻路中尝试绕行");
         }
 
-        /** 查找玩家正前方（行进方向）的阻挡方块：先查相邻脚部/身体高度，其次视线射线 */
-        BlockPos findBlockInFront(ClientPlayerEntity player) {
-            World world = player.getWorld();
-            BlockPos pos = player.getBlockPos();
-            double rad = Math.toRadians(player.getYaw());
-            int dx = (int) Math.round(-Math.sin(rad));
-            int dz = (int) Math.round(Math.cos(rad));
-            for (int dy = 0; dy <= 1; dy++) {
-                BlockPos front = new BlockPos(pos.getX() + dx, pos.getY() + dy, pos.getZ() + dz);
-                if (!world.getBlockState(front).isAir()) {
-                    return front;
-                }
-            }
-            // 相邻一格没有方块：用视线射线找更远处的墙
-            return findObstacleInFront(player, tx, ty, tz);
-        }
-
         private void applyMove(MinecraftClient client, ClientPlayerEntity player,
                                double yaw, double pitch, boolean jump, int sDir) {
             player.setYaw((float) yaw);
@@ -847,6 +830,24 @@ public class ActionExecutor {
             }
         }
     }
+    /** 查找玩家正前方（行进方向）的阻挡方块：先查相邻脚部/身体高度，其次视线射线 */
+    private static BlockPos findBlockInFront(ClientPlayerEntity player,
+                                             double tx, double ty, double tz) {
+        World world = player.getWorld();
+        BlockPos pos = player.getBlockPos();
+        double rad = Math.toRadians(player.getYaw());
+        int dx = (int) Math.round(-Math.sin(rad));
+        int dz = (int) Math.round(Math.cos(rad));
+        for (int dy = 0; dy <= 1; dy++) {
+            BlockPos front = new BlockPos(pos.getX() + dx, pos.getY() + dy, pos.getZ() + dz);
+            if (!world.getBlockState(front).isAir()) {
+                return front;
+            }
+        }
+        // 相邻一格没有方块：用视线射线找更远处的墙
+        return findObstacleInFront(player, tx, ty, tz);
+    }
+
     /** 在主线程同步查找前方障碍方块（排除目标本身） */
     private static BlockPos findObstacleInFront(ClientPlayerEntity player,
                                                 double tx, double ty, double tz) {
@@ -1270,7 +1271,8 @@ public class ActionExecutor {
                     if (stuckCount >= 2) {
                         releaseAllKeys(client);
                         // 优先挖掉路径遮挡
-                        BlockPos ob = findBlockInFront(player);
+                        BlockPos ob = findBlockInFront(player,
+                                target.getX() + 0.5, target.getY() + 0.5, target.getZ() + 0.5);
                         if (ob != null && isBreakable(player, ob)) {
                             if (ob.equals(lastUnbreakable)) {
                                 // 这个遮挡上次挖不动：跳过当前目标换下一个

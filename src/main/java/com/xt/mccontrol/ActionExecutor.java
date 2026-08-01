@@ -2439,7 +2439,7 @@ public class ActionExecutor {
             for (int i = 0; i < 36; i++) {
                 ItemStack s = inv.getStack(i);
                 if (s.isEmpty()) continue;
-                if (s.getItem().getFuelTime() > 0) return i;
+                if (AbstractFurnaceScreenHandler.createFuelTimeMap().containsKey(s.getItem())) return i;
             }
             return -1;
         }

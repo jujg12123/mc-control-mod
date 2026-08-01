@@ -3185,16 +3185,12 @@ public class ActionExecutor {
         if (lower.equals("furnace") || lower.equals("blast_furnace") || lower.equals("smoker")) {
             String display = lower.equals("blast_furnace") ? "高炉"
                     : (lower.equals("smoker") ? "烟熏炉" : "熔炉");
-            result += "
-
-【提示】以上是制作" + display + "的方法。"
+            result += "\n\n【提示】以上是制作" + display + "的方法。"
                     + "若你想烧炼物品（如 raw_iron → iron_ingot、铁矿石 → 铁锭），"
                     + "请查询目标产物（如 mc_queryRecipe iron_ingot），"
                     + "然后在附近放置炉子后直接调用 mc_craft。";
         } else if (lower.equals("iron_ingot") || lower.equals("gold_ingot")) {
-            result += "
-
-【提示】铁锭/金锭通常有两种途径："
+                    result += "\n\n【提示】铁锭/金锭通常有两种途径："
                     + "① 熔炉烧炼（矿石/粗金属 + 燃料，需要熔炉）；"
                     + "② 工作台合成（铁粒/铁块分解）。"
                     + "如果你有粗铁/铁矿石，请先放置熔炉（mc_place furnace）再调用 mc_craft。";

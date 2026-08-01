@@ -569,8 +569,11 @@ public class ActionExecutor {
         private List<BlockPos> path = null;
         private int pathIdx = 0;
         private int replanTicks = 0;
-        private BlockPos pillarPos = null;   // PILLAR 已放置的垫脚方块
-        private boolean pillarJumped = false;
+        private double pillarTargetY = 0;    // PILLAR 目标脚部高度（0=用任务目标判定）
+        private int pillarBaseY = 0;         // PILLAR 起点（玩家起始站立格）
+        private int pillarLayers = 0;        // PILLAR 已叠的垫脚层数
+        private boolean pillarPlaced = false;// PILLAR 当前跳跃周期是否已放置方块
+        private int pillarFailTicks = 0;     // PILLAR 放置失败累计 tick
 
         NavTask(ClientPlayerEntity player, double tx, double ty, double tz, boolean emitResult, String resultAction) {
             this.tx = tx; this.ty = ty; this.tz = tz;
@@ -635,9 +638,9 @@ public class ActionExecutor {
                 startDrillDown(client, player);
                 return false;
             }
-            // 目标太高且水平已贴近（够不着）：尝试垫脚
+            // 目标太高且水平已贴近（够不着）：尝试垫脚（跳跃+脚下叠方块，逐层上升）
             double eyeDy = ty - (player.getY() + player.getEyeHeight(player.getPose()));
-            if (eyeDy > 3.4 && hDist < 2.2) {
+            if (eyeDy > 2.0 && hDist < 2.2) {
                 startPillar(client, player);
                 return false;
             }
@@ -654,6 +657,14 @@ public class ActionExecutor {
             double gx = tx, gz = tz;
             if (path != null && pathIdx < path.size()) {
                 BlockPos wp = path.get(pathIdx);
+                // 路径点比玩家高 2 格以上（2 格台阶/陡坡）：原地垫脚叠一层再走
+                double wpRise = wp.getY() - player.getY();
+                double wpDist = Math.sqrt((wp.getX() + 0.5 - px) * (wp.getX() + 0.5 - px)
+                        + (wp.getZ() + 0.5 - pz) * (wp.getZ() + 0.5 - pz));
+                if (wpRise > 1.6 && wpDist < 2.5) {
+                    startPillar(client, player, wp.getY());
+                    return false;
+                }
                 gx = wp.getX() + 0.5;
                 gz = wp.getZ() + 0.5;
                 double wdx = gx - px;
@@ -719,6 +730,11 @@ public class ActionExecutor {
                     // 目标在脚下（被地面挡住走不动）：直接挖脚下
                     if (hDist < 1.5 && ty < player.getY() - 0.5) {
                         startDrillDown(client, player);
+                        return false;
+                    }
+                    // 目标在上方且水平贴近：先垫脚爬升，而不是挖穿前方墙壁
+                    if (ty > player.getY() + 2.2 && hDist < 3.0) {
+                        startPillar(client, player);
                         return false;
                     }
                     // 优先尝试挖掘正前方的阻挡方块
@@ -816,81 +832,103 @@ public class ActionExecutor {
             path = null;
         }
 
-        /** 垫脚子状态：目标太高够不着时，从背包找方块垫到身边并跳上去 */
+        /** 垫脚子状态：目标太高够不着时，跳跃+在脚下垫方块逐层上升（1x1 竖井内也能用） */
         private boolean tickPillar(MinecraftClient client, ClientPlayerEntity player) {
             stateTicks++;
-            if (pillarPos != null) {
-                // 已放置垫脚方块：朝目标前进+跳跃，直到站上垫脚方块
-                double dx = tx - player.getX();
-                double dz = tz - player.getZ();
-                player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
-                player.setPitch(0);
-                client.options.forwardKey.setPressed(true);
-                client.options.jumpKey.setPressed(true);
-                if (player.getY() > pillarPos.getY() + 0.9) {
+            double eyeY = player.getY() + player.getEyeHeight(player.getPose());
+            double eyeDy = ty - eyeY;
+            if (pillarTargetY > 0) {
+                // 按脚部高度判定（路径点垫脚）：脚达到目标层即结束
+                if (player.getY() >= pillarTargetY - 0.6) {
                     endPillar(client, player);
                     return false;
                 }
-                if (stateTicks > 40) {
-                    // 2 秒没站上去：放弃垫脚
-                    endPillar(client, player);
-                    StateCollector.addBehaviorLog("寻路垫脚失败，继续尝试直接前进");
-                    return false;
-                }
+            } else if (eyeDy <= 1.0) {
+                // 按目标判定：目标已够得着，交给正常导航收尾
+                endPillar(client, player);
                 return false;
             }
-            // 找垫脚方块并放置到前方一格的地面上
+            // 超时/跌落保护
+            if (stateTicks > 260 || player.getY() < pillarBaseY - 1.0) {
+                endPillar(client, player);
+                StateCollector.addBehaviorLog("寻路垫脚超时，放弃垫脚继续前进");
+                return false;
+            }
+            if (pillarLayers >= 8) {
+                endPillar(client, player);
+                StateCollector.addBehaviorLog("寻路垫脚已达 8 层上限，停止垫脚");
+                return false;
+            }
+            // 背包垫脚方块
             int slot = findPillarSlot(client, player);
             if (slot < 0) {
-                StateCollector.addBehaviorLog("背包没有可垫脚的方块，放弃垫脚");
-                state = NAV;
+                endPillar(client, player);
+                StateCollector.addBehaviorLog("寻路垫脚: 背包没有可垫脚的方块，放弃垫脚");
                 return false;
             }
             player.getInventory().selectedSlot = slot;
-            double dx = tx - player.getX();
-            double dz = tz - player.getZ();
-            player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
-            player.setPitch(0);
-            BlockPos front = player.getBlockPos().offset(facingDir(player));
-            BlockPos ground = front.down();
             World world = player.getWorld();
-            if (!world.getBlockState(front).isAir()) {
-                // 前方已有方块：直接跳上去
-                pillarPos = front;
-                stateTicks = 0;
+            int px = player.getBlockPos().getX();
+            int pz = player.getBlockPos().getZ();
+            int standY = pillarBaseY + pillarLayers;   // 玩家当前站立格
+            // 头顶空间：站上新层后需要 standY+1、standY+2 两格空气
+            if (!world.getBlockState(new BlockPos(px, standY + 1, pz)).isAir()
+                    || !world.getBlockState(new BlockPos(px, standY + 2, pz)).isAir()) {
+                endPillar(client, player);
+                StateCollector.addBehaviorLog("寻路垫脚: 头顶空间不足，停止垫脚");
                 return false;
             }
-            if (!world.getBlockState(ground).isAir()) {
-                Vec3d hitPos = new Vec3d(ground.getX() + 0.5, ground.getY() + 1.0, ground.getZ() + 0.5);
-                BlockHitResult bhr = new BlockHitResult(hitPos, Direction.UP, ground, false);
+            // 持续跳跃；脚升过当前格后，点击脚下方块顶面垫一块（经典搭高法）
+            client.options.jumpKey.setPressed(true);
+            double rise = player.getY() - standY;
+            if (!pillarPlaced && rise > 1.05) {
+                BlockPos below = new BlockPos(px, standY - 1, pz);
+                Vec3d hitPos = new Vec3d(below.getX() + 0.5, standY, below.getZ() + 0.5);
+                BlockHitResult bhr = new BlockHitResult(hitPos, Direction.UP, below, false);
                 ActionResult res = client.interactionManager.interactBlock(player, Hand.MAIN_HAND, bhr);
                 if (res.isAccepted()) {
-                    pillarPos = front;
-                    stateTicks = 0;
-                    StateCollector.addBehaviorLog("寻路垫脚: 放置 " + front.toShortString());
+                    pillarPlaced = true;
+                    pillarLayers++;
+                    pillarFailTicks = 0;
+                    StateCollector.addBehaviorLog("寻路垫脚: 已垫 " + pillarLayers + " 层");
+                } else if (++pillarFailTicks > 20) {
+                    endPillar(client, player);
+                    StateCollector.addBehaviorLog("寻路垫脚: 方块放置失败，放弃垫脚");
                     return false;
                 }
+            } else if (pillarPlaced && rise < 0.5) {
+                // 已落到新层：允许下一轮起跳时再垫
+                pillarPlaced = false;
             }
-            // 放置失败（悬崖/低洼等）：放弃垫脚
-            StateCollector.addBehaviorLog("寻路垫脚: 放置失败");
-            state = NAV;
             return false;
         }
 
         private void startPillar(MinecraftClient client, ClientPlayerEntity player) {
+            startPillar(client, player, 0);
+        }
+
+        /** 开始垫脚：targetY>0 时按脚部高度目标（路径点），否则按任务目标高度判定 */
+        private void startPillar(MinecraftClient client, ClientPlayerEntity player, double targetY) {
             state = PILLAR;
             stateTicks = 0;
-            pillarPos = null;
+            pillarTargetY = targetY;
+            pillarBaseY = (int) Math.floor(player.getY());
+            pillarLayers = 0;
+            pillarPlaced = false;
+            pillarFailTicks = 0;
             client.options.attackKey.setPressed(false);
             client.options.jumpKey.setPressed(false);
             client.options.forwardKey.setPressed(false);
+            StateCollector.addBehaviorLog("寻路垫脚开始" + (targetY > 0 ? "（目标层 " + (int) targetY + "）" : ""));
         }
 
         private void endPillar(MinecraftClient client, ClientPlayerEntity player) {
             client.options.forwardKey.setPressed(false);
             client.options.jumpKey.setPressed(false);
-            pillarPos = null;
-            pillarJumped = false;
+            pillarTargetY = 0;
+            pillarLayers = 0;
+            pillarPlaced = false;
+            pillarFailTicks = 0;
             state = NAV;
             path = null;   // 玩家位置已变，强制重新规划
             stuckCount = 0;
@@ -1094,8 +1132,9 @@ public class ActionExecutor {
             for (int d = 0; d < 4; d++) {
                 int nx = cur.getX() + dx[d];
                 int nz = cur.getZ() + dz[d];
-                // 从同高度到 +1 层找站立点（走下不主动规划，玩家会自然下落）
-                for (int dy = 0; dy <= 1; dy++) {
+                // 从同高度到 +2 层找站立点（走下不主动规划，玩家会自然下落）。
+                // +2 是 2 格高台阶：路径点会触发 NavTask 垫脚（原地叠方块）后再走
+                for (int dy = 0; dy <= 2; dy++) {
                     BlockPos cand = new BlockPos(nx, cur.getY() + dy, nz);
                     if (cand.getY() < world.getBottomY() + 1 || cand.getY() > world.getTopY()) continue;
                     if (isStandable(world, cand) && visited.add(cand)) {
@@ -1608,7 +1647,9 @@ public class ActionExecutor {
         private int state = FIND;
         private int stateTicks = 0;
         private BlockPos target = null;
-        private BlockPos pillarPos = null;   // 已放置的垫脚方块
+        private BlockPos pillarBase = null;  // 垫脚起点（记录玩家起始站立格）
+        private boolean pillarPlaced = false;// 当前跳跃周期是否已放置方块
+        private int pillarFailTicks = 0;     // 放置失败累计 tick
         private double lastCheckX = 0, lastCheckZ = 0;
         private int checkCounter = 0;
         private int stuckCount = 0;
@@ -1725,7 +1766,9 @@ public class ActionExecutor {
                         releaseAllKeys(client);
                         state = PILLAR;
                         stateTicks = 0;
-                        pillarPos = null;
+                        pillarBase = null;
+                        pillarPlaced = false;
+                        pillarFailTicks = 0;
                         return false;
                     }
                     // 足够近且手够得着（含目标在脚下深处：朝下挖穿即可）
@@ -1801,38 +1844,57 @@ public class ActionExecutor {
                     }
                     return false;
                 }
-                default: { // PILLAR：垫脚
+                default: { // PILLAR：垫脚（跳跃+脚下叠方块逐层上升，1x1 竖井内也能用）
                     stateTicks++;
-                    if (pillarPos != null) {
-                        // 已放置：跳上去（持续前进+跳跃直到站到垫脚方块上方）
-                        double dx = target.getX() + 0.5 - player.getX();
-                        double dz = target.getZ() + 0.5 - player.getZ();
-                        player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
-                        client.options.forwardKey.setPressed(true);
-                        client.options.jumpKey.setPressed(true);
-                        if (player.getY() > pillarPos.getY() + 0.9) {
-                            releaseAllKeys(client);
-                            pillarPos = null;
-                            state = WALK;
-                            stateTicks = 0;
-                            stuckCount = 0;
-                            return false;
-                        }
-                        if (stateTicks > 40) { // 2 秒没站上去
-                            releaseAllKeys(client);
-                            pillarPos = null;
-                            markedBlocks.remove(target);
-                            skipped++;
-                            StateCollector.addBehaviorLog("连续挖掘: 垫脚失败，跳过高处目标");
-                            state = FIND;
-                            stateTicks = 0;
-                            return false;
-                        }
+                    if (pillarBase == null) {
+                        // 记录起点后下一 tick 再开始垫
+                        pillarBase = player.getBlockPos();
+                        stateTicks = 0;
                         return false;
                     }
-                    // 找垫脚方块
+                    double feetY = player.getY();
+                    double eyeDy = target.getY() + 0.5
+                            - (feetY + player.getEyeHeight(player.getPose()));
+                    double hDist = Math.sqrt(
+                            (target.getX() + 0.5 - player.getX()) * (target.getX() + 0.5 - player.getX())
+                                    + (target.getZ() + 0.5 - player.getZ()) * (target.getZ() + 0.5 - player.getZ()));
+                    // 够得着了：回去挖（太远则先走两步）
+                    if (Math.abs(eyeDy) <= 3.5 || stateTicks > 240) {
+                        releaseAllKeys(client);
+                        pillarBase = null;
+                        pillarPlaced = false;
+                        pillarFailTicks = 0;
+                        stateTicks = 0;
+                        if (Math.abs(eyeDy) <= 3.5) {
+                            state = (hDist <= 4.5) ? MINE : WALK;
+                        } else {
+                            markedBlocks.remove(target);
+                            skipped++;
+                            StateCollector.addBehaviorLog("连续挖掘: 垫脚超时，跳过高处目标");
+                            state = FIND;
+                        }
+                        stuckCount = 0;
+                        return false;
+                    }
+                    int baseY = pillarBase.getY();
+                    int standY = (int) Math.floor(feetY);
+                    if (standY - baseY >= 8) {
+                        // 已垫 8 层仍够不着：跳过该目标
+                        releaseAllKeys(client);
+                        pillarBase = null;
+                        pillarPlaced = false;
+                        pillarFailTicks = 0;
+                        markedBlocks.remove(target);
+                        skipped++;
+                        StateCollector.addBehaviorLog("连续挖掘: 垫脚已达 8 层上限，跳过高处目标");
+                        state = FIND;
+                        stateTicks = 0;
+                        return false;
+                    }
                     int slot = findPillarSlot(client, player);
                     if (slot < 0) {
+                        releaseAllKeys(client);
+                        pillarBase = null;
                         markedBlocks.remove(target);
                         skipped++;
                         StateCollector.addBehaviorLog("连续挖掘: 背包没有可垫脚的方块，跳过高处目标");
@@ -1841,38 +1903,51 @@ public class ActionExecutor {
                         return false;
                     }
                     player.getInventory().selectedSlot = slot;
-                    // 放置到玩家前方一格（地面上的空气位置）
-                    double dx = target.getX() + 0.5 - player.getX();
-                    double dz = target.getZ() + 0.5 - player.getZ();
-                    player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
-                    BlockPos front = player.getBlockPos().offset(facingDir(player));
-                    BlockPos ground = front.down();
                     World world = player.getWorld();
-                    if (!world.getBlockState(front).isAir()) {
-                        // 前方已有方块：直接跳上去
-                        pillarPos = front;
+                    int px = player.getBlockPos().getX();
+                    int pz = player.getBlockPos().getZ();
+                    // 头顶空间：站上新层后需要 standY+1、standY+2 两格空气
+                    if (!world.getBlockState(new BlockPos(px, standY + 1, pz)).isAir()
+                            || !world.getBlockState(new BlockPos(px, standY + 2, pz)).isAir()) {
+                        releaseAllKeys(client);
+                        pillarBase = null;
+                        pillarPlaced = false;
+                        pillarFailTicks = 0;
+                        markedBlocks.remove(target);
+                        skipped++;
+                        StateCollector.addBehaviorLog("连续挖掘: 头顶空间不足，跳过高处目标");
+                        state = FIND;
                         stateTicks = 0;
                         return false;
                     }
-                    if (!world.getBlockState(ground).isAir()) {
-                        // 点击地面顶面，新方块会出现在 front
-                        Vec3d hitPos = new Vec3d(ground.getX() + 0.5, ground.getY() + 1.0, ground.getZ() + 0.5);
-                        BlockHitResult bhr = new BlockHitResult(hitPos, Direction.UP, ground, false);
-                        ActionResult res = client.interactionManager
-                                .interactBlock(player, Hand.MAIN_HAND, bhr);
+                    // 持续跳跃；脚升过当前格后，点击脚下方块顶面垫一块（经典搭高法）
+                    client.options.jumpKey.setPressed(true);
+                    double rise = feetY - standY;
+                    if (!pillarPlaced && rise > 1.05) {
+                        BlockPos below = new BlockPos(px, standY - 1, pz);
+                        Vec3d hitPos = new Vec3d(below.getX() + 0.5, standY, below.getZ() + 0.5);
+                        BlockHitResult bhr = new BlockHitResult(hitPos, Direction.UP, below, false);
+                        ActionResult res = client.interactionManager.interactBlock(player, Hand.MAIN_HAND, bhr);
                         if (res.isAccepted()) {
-                            pillarPos = front;
+                            pillarPlaced = true;
+                            pillarFailTicks = 0;
+                            StateCollector.addBehaviorLog("连续挖掘: 垫脚 +1 层");
+                        } else if (++pillarFailTicks > 20) {
+                            releaseAllKeys(client);
+                            pillarBase = null;
+                            pillarPlaced = false;
+                            pillarFailTicks = 0;
+                            markedBlocks.remove(target);
+                            skipped++;
+                            StateCollector.addBehaviorLog("连续挖掘: 垫脚方块放置失败，跳过高处目标");
+                            state = FIND;
                             stateTicks = 0;
-                            StateCollector.addBehaviorLog("连续挖掘: 放置垫脚方块 " + front.toShortString());
                             return false;
                         }
+                    } else if (pillarPlaced && rise < 0.5) {
+                        // 已落到新层：允许下一轮起跳时再垫
+                        pillarPlaced = false;
                     }
-                    // 放置失败（悬崖/低洼等）：跳过该目标
-                    markedBlocks.remove(target);
-                    skipped++;
-                    StateCollector.addBehaviorLog("连续挖掘: 垫脚位置不合适，跳过高处目标");
-                    state = FIND;
-                    stateTicks = 0;
                     return false;
                 }
             }
@@ -2012,6 +2087,7 @@ public class ActionExecutor {
         private int moveTicks = 0;            // 挖不动时水平换位的剩余 tick
         private float moveYaw = 0;            // 水平换位的方向
         private BlockPos lastDigPos = null;   // 最近一次尝试挖的头顶方块（检测挖不动）
+        private int jumpTimer = 0;            // 按住跳跃的剩余 tick（跳满 0.4 秒才能爬 1 格）
 
         GoToSurfaceTask() {
             this.myVersion = actionVersion;
@@ -2128,29 +2204,46 @@ public class ActionExecutor {
 
             // ---- 向上挖 ----
             phaseTicks++;
-            BlockPos above = pos.up();
-            BlockState aboveState = player.getWorld().getBlockState(above);
-            player.setPitch(-90f);
-
-            if (aboveState.isAir()) {
-                // 头顶是空气，跳跃上去
-                client.options.attackKey.setPressed(false);
+            if (jumpTimer > 0) {
+                // 跳跃计时：挖穿后保持跳跃 8 tick（0.4 秒），确保能跳上 1 格
+                jumpTimer--;
                 client.options.jumpKey.setPressed(true);
-                client.options.forwardKey.setPressed(true);
-                if (phaseTicks > 10) {
+                if (jumpTimer == 0) {
                     client.options.jumpKey.setPressed(false);
-                    client.options.forwardKey.setPressed(false);
-                    phaseTicks = 0;
                 }
-            } else {
-                // 头顶有方块，挖掉（自动切工具）
-                ensureBestTool(player, aboveState);
+                return false;
+            }
+            client.options.jumpKey.setPressed(false);
+            World world = player.getWorld();
+            player.setPitch(-90f);
+            // 找头顶可达范围内最近的实心方块（+1..+3）：一次挖穿 2-3 格高的间隙，
+            // 避免“头顶是空气但上面还有方块”时原地空跳永远上不去
+            BlockPos upDigTarget = null;
+            for (int k = 1; k <= 3; k++) {
+                BlockPos cand = pos.up(k);
+                if (world.getBlockState(cand).isAir()) continue;
+                double eyeY = player.getY() + player.getEyeHeight(player.getPose());
+                if (Math.abs(cand.getY() + 0.5 - eyeY) <= 4.2) {
+                    upDigTarget = cand;
+                }
+                break;
+            }
+            if (upDigTarget != null) {
+                // 瞄准头顶方块挖掘（自动切工具）；挖穿后跳 8 tick 上去
+                BlockState targetState = world.getBlockState(upDigTarget);
+                ensureBestTool(player, targetState);
                 client.options.attackKey.setPressed(true);
+                double ddx = upDigTarget.getX() + 0.5 - player.getX();
+                double ddy = upDigTarget.getY() + 0.5
+                        - (player.getY() + player.getEyeHeight(player.getPose()));
+                double ddz = upDigTarget.getZ() + 0.5 - player.getZ();
+                player.setYaw((float) Math.toDegrees(Math.atan2(-ddx, ddz)));
+                player.setPitch((float) Math.toDegrees(-Math.atan2(ddy, Math.sqrt(ddx * ddx + ddz * ddz))));
                 // 检测是否挖不动（基岩/黑曜石等）
-                if (above.equals(lastDigPos)) {
+                if (upDigTarget.equals(lastDigPos)) {
                     digStuckTicks++;
                 } else {
-                    lastDigPos = above;
+                    lastDigPos = upDigTarget;
                     digStuckTicks = 0;
                 }
                 if (digStuckTicks > 60) {
@@ -2162,14 +2255,22 @@ public class ActionExecutor {
                     moveYaw = player.getYaw() + (float) (Math.random() * 240 - 120);
                     StateCollector.addBehaviorLog("头顶方块挖不动，水平移动换位置");
                 }
-                if (player.getWorld().getBlockState(above).isAir()) {
-                    client.options.attackKey.setPressed(false);
-                    client.options.jumpKey.setPressed(true);
-                    if (phaseTicks > 5) {
-                        client.options.jumpKey.setPressed(false);
-                        phaseTicks = 0;
+                // 头顶 +1..+3 全部挖空才起跳：只挖 1 格就跳会被上面的方块卡住（竖井爬升至少需要 2 格高）
+                boolean clearAbove = true;
+                for (int k = 1; k <= 3; k++) {
+                    if (!world.getBlockState(pos.up(k)).isAir()) {
+                        clearAbove = false;
+                        break;
                     }
                 }
+                if (clearAbove) {
+                    client.options.attackKey.setPressed(false);
+                    jumpTimer = 8;
+                }
+            } else {
+                // 头顶 3 格内没有方块：起跳上 1 格（跳 8 tick 后松开）
+                client.options.attackKey.setPressed(false);
+                jumpTimer = 8;
             }
             return false;
         }
@@ -2433,20 +2534,48 @@ public class ActionExecutor {
             return -1;
         }
 
-        /** 从背包找燃料槽位（煤炭/木炭/木板/原木等，按原版燃料时间判断） */
+        /**
+         * 从背包找燃料槽位。
+         * Yarn 1.20.1 没有公开的 Item#getFuelTime()（那是 Mojang 映射 API），
+         * 这里用熔炉燃料槽的 Slot#canInsert() 判断（原版逻辑：isFuel || 岩浆桶，
+         * 兼容模组燃料）；界面未打开时回退到常见燃料硬编码判断。
+         */
         private int findFuelSlot(ClientPlayerEntity player) {
             PlayerInventory inv = player.getInventory();
+            boolean furnaceOpen = player.currentScreenHandler instanceof AbstractFurnaceScreenHandler;
             for (int i = 0; i < 36; i++) {
                 ItemStack s = inv.getStack(i);
                 if (s.isEmpty()) continue;
-                // 1.20.1: 检查常见燃料
-                String name = Registries.ITEM.getId(s.getItem()).getPath();
-                if (name.contains("coal") || name.contains("charcoal") || 
-                    name.contains("plank") || name.contains("log") || 
-                    name.contains("wood") || name.contains("stick") ||
-                    name.contains("lava_bucket") || name.contains("blaze_rod")) return i;
+                if (furnaceOpen) {
+                    // 熔炉界面已打开：用燃料槽的插入规则精确判断
+                    if (((AbstractFurnaceScreenHandler) player.currentScreenHandler)
+                            .getSlot(1).canInsert(s)) {
+                        return i;
+                    }
+                } else if (isCommonFuel(s)) {
+                    return i;
+                }
             }
             return -1;
+        }
+
+        /** 常见燃料硬编码判断（界面未打开时的兜底） */
+        private static boolean isCommonFuel(ItemStack stack) {
+            Identifier id = Registries.ITEM.getId(stack.getItem());
+            if (id == null) return false;
+            String p = id.getPath().toLowerCase();
+            return p.contains("coal") || p.contains("charcoal")
+                    || p.contains("_log") || p.contains("_wood") || p.contains("_planks")
+                    || p.contains("_stem") || p.contains("_hyphae") || p.contains("_sapling")
+                    || p.contains("_fence") || p.contains("_fence_gate") || p.contains("_door")
+                    || p.contains("_slab") || p.contains("_stairs") || p.contains("_pressure_plate")
+                    || p.contains("_button") || p.contains("torch") || p.contains("_sign")
+                    || p.contains("_boat") || p.contains("ladder") || p.contains("bookshelf")
+                    || p.contains("crafting_table") || p.contains("chest") || p.contains("_barrel")
+                    || p.contains("lava_bucket") || p.contains("blaze_rod")
+                    || p.contains("dried_kelp_block") || p.contains("sugar_cane")
+                    || p.contains("cactus") || p.contains("scaffolding") || p.contains("stick")
+                    || p.equals("bamboo") || p.equals("bowl");
         }
 
         /** 背包槽位 → 熔炉界面屏幕槽位 */
@@ -3195,7 +3324,7 @@ public class ActionExecutor {
                     + "请查询目标产物（如 mc_queryRecipe iron_ingot），"
                     + "然后在附近放置炉子后直接调用 mc_craft。";
         } else if (lower.equals("iron_ingot") || lower.equals("gold_ingot")) {
-                    result += "\n\n【提示】铁锭/金锭通常有两种途径："
+            result += "\n\n【提示】铁锭/金锭通常有两种途径："
                     + "① 熔炉烧炼（矿石/粗金属 + 燃料，需要熔炉）；"
                     + "② 工作台合成（铁粒/铁块分解）。"
                     + "如果你有粗铁/铁矿石，请先放置熔炉（mc_place furnace）再调用 mc_craft。";

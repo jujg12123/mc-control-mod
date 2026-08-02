@@ -175,7 +175,10 @@ class MCControlPlugin extends Plugin {
             { type: 'function', function: { name: 'mc_queryRecipe', description: '查询任意物品的合成配方。返回所需的材料、合成站（工作台/熔炉/背包等）和摆放方式。类似 JEI 物品管理器的配方查询功能。用于了解合成某个物品需要什么材料、在什么条件下合成、怎么摆放。支持原版和模组配方', parameters: { type: 'object', properties: { item: { type: 'string', description: '要查询的物品 ID，如 oak_planks, iron_ingot, diamond_pickaxe, shield' } }, required: ['item'] } } },
             { type: 'function', function: { name: 'mc_status', description: '查询 Minecraft 连接状态和当前游戏信息', parameters: { type: 'object', properties: {}, required: [] } } },
             { type: 'function', function: { name: 'mc_enableAuto', description: '启用自动行为模式（自卫、防饥饿、防卡、拾取等底层自动行为）', parameters: { type: 'object', properties: {}, required: [] } } },
-            { type: 'function', function: { name: 'mc_disableAuto', description: '禁用自动行为模式', parameters: { type: 'object', properties: {}, required: [] } } }
+            { type: 'function', function: { name: 'mc_disableAuto', description: '禁用自动行为模式', parameters: { type: 'object', properties: {}, required: [] } } },
+            { type: 'function', function: { name: 'mc_build', description: 'Batch build: place many blocks as ONE background task (Numen-style ops). ops entries: {op:"set",block_id,x,y,z}, {op:"box",block_id,x1,y1,z1,x2,y2,z2,hollow?}, {op:"walls",block_id,x1,y1,z1,x2,y2,z2} (perimeter ring only, no top/bottom), {op:"line",block_id,x1,y1,z1,x2,y2,z2}, {op:"clear",x,y,z} or block_id "air" digs the cell out. block_id uses English ids like oak_planks/stone_bricks/dirt. The mod checks ALL materials up front and refuses the whole job if anything is short, so put the ENTIRE building in ONE call. Cells are built ground-up, each placement verified. Coordinates are absolute. Wait for the result; never resend while running.', parameters: { type: 'object', properties: { ops: { type: 'array', description: 'ordered list of build ops, later ops overwrite earlier cells', items: { type: 'object' } } }, required: ['ops'] } } },
+            { type: 'function', function: { name: 'mc_enableReflex', description: 'Enable one automatic survival reflex. name: self_defense, eat, stuck, pickup, mlg (water-bucket fall save), breath (swim up when drowning), or "all" for the master switch.', parameters: { type: 'object', properties: { name: { type: 'string', description: 'reflex name or "all"' } }, required: ['name'] } } },
+            { type: 'function', function: { name: 'mc_disableReflex', description: 'Disable one automatic survival reflex. Same names as mc_enableReflex.', parameters: { type: 'object', properties: { name: { type: 'string', description: 'reflex name or "all"' } }, required: ['name'] } } }
         ];
     }
 
@@ -239,11 +242,16 @@ class MCControlPlugin extends Plugin {
             case 'mc_drop': return this.sendActionAndWait({ action: 'drop' });
             case 'mc_goToBlock': {
                 const { block_type, range = 64 } = params;
-                return this.sendActionAndWait({ action: 'go_to_block', block_type, range });
+                // distance-budgeted timeout: larger search range gets more time
+                return this.sendActionAndWait({ action: 'go_to_block', block_type, range, distance: Math.max(16, range) });
             }
             case 'mc_goToPos': {
                 const { x, y, z } = params;
-                return this.sendActionAndWait({ action: 'go_to_pos', x, y, z });
+                const s = this.mc.getState();
+                const dist = s && s.x !== undefined
+                    ? Math.max(8, Math.hypot(x - s.x, z - s.z))
+                    : 64;
+                return this.sendActionAndWait({ action: 'go_to_pos', x, y, z, distance: dist });
             }
             case 'mc_stopNav': return this.sendActionAndWait({ action: 'stop_nav' });
             case 'mc_goal': {
@@ -281,6 +289,24 @@ class MCControlPlugin extends Plugin {
             }
             case 'mc_enableAuto': return this.sendActionAndWait({ action: 'enable_auto' });
             case 'mc_disableAuto': return this.sendActionAndWait({ action: 'disable_auto' });
+            case 'mc_enableReflex': {
+                const { name = '' } = params || {};
+                return this.sendActionAndWait({ action: 'enable_reflex', name });
+            }
+            case 'mc_disableReflex': {
+                const { name = '' } = params || {};
+                return this.sendActionAndWait({ action: 'disable_reflex', name });
+            }
+            case 'mc_build': {
+                const ops = (params || {}).ops;
+                if (!Array.isArray(ops) || ops.length === 0) {
+                    return 'mc_build: ops must be a non-empty array';
+                }
+                const cells = countBuildCells(ops);
+                const timeoutSec = Math.min(600, 30 + cells * 6);
+                return this.sendActionAndWait(
+                    { action: 'build', ops, timeoutSec }, timeoutSec * 1000);
+            }
             case 'mc_craft': {
                 const { recipe, count = 1 } = params;
                 return this.sendActionAndWait({ action: 'craft', recipe, count });
@@ -418,7 +444,8 @@ class MCControlPlugin extends Plugin {
 
         let timeout = customTimeout || 10000;
         if (action.action === 'go_to_pos' || action.action === 'go_to_block') {
-            timeout = 35000;
+            // distance-budgeted timeout: 20s + 3s per block (cap 5 min)
+            timeout = Math.min(300000, Math.max(20000, (action.distance || 32) * 3000));
         } else if (action.action === 'dig_down') {
             timeout = Math.max(10000, (action.distance || 1) * 3500);
         } else if (action.action === 'go_to_surface') {
@@ -429,6 +456,8 @@ class MCControlPlugin extends Plugin {
             timeout = 15000;
         } else if (action.action === 'query_recipe') {
             timeout = 8000;
+        } else if (action.action === 'build') {
+            timeout = Math.max(40000, (action.timeoutSec || 60) * 1000);
         }
 
         return new Promise((resolve) => {
@@ -441,7 +470,7 @@ class MCControlPlugin extends Plugin {
                     this._pendingCalls.delete(callId);
                 }
                 const longTask = ['go_to_pos', 'go_to_block', 'dig_block', 'dig_down',
-                        'go_to_surface', 'craft', 'query_recipe'].includes(action.action);
+                        'go_to_surface', 'craft', 'query_recipe', 'build'].includes(action.action);
                 this._busyActions.set(action.action, Date.now() + (longTask ? 40000 : 15000));
                 resolve('⚠️ 动作执行超时，可能仍在进行中');
             }, timeout);
@@ -490,6 +519,35 @@ class MCControlPlugin extends Plugin {
         const msg = result.message || (success ? '成功' : '失败');
         pending.resolve((success ? '✅ ' : '❌ ') + msg);
     }
+}
+
+// Estimate the number of target cells for ops (used for build timeout budgeting).
+function countBuildCells(ops) {
+    let total = 0;
+    for (const op of ops || []) {
+        const o = op || {};
+        if (o.op === 'set' || o.op === 'clear') {
+            total += 1;
+        } else if (o.op === 'line') {
+            const dx = (o.x2 || 0) - (o.x1 || 0);
+            const dy = (o.y2 || 0) - (o.y1 || 0);
+            const dz = (o.z2 || 0) - (o.z1 || 0);
+            total += Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz)) + 1;
+        } else if (o.op === 'box' || o.op === 'walls') {
+            const nx = Math.abs((o.x2 || 0) - (o.x1 || 0)) + 1;
+            const ny = Math.abs((o.y2 || 0) - (o.y1 || 0)) + 1;
+            const nz = Math.abs((o.z2 || 0) - (o.z1 || 0)) + 1;
+            if (o.op === 'walls') {
+                total += 2 * (nx * nz) + 2 * (Math.max(0, nx - 2) * (ny - 2) + Math.max(0, nz - 2) * (ny - 2));
+            } else if (o.hollow) {
+                total += nx * ny * nz
+                        - Math.max(0, nx - 2) * Math.max(0, ny - 2) * Math.max(0, nz - 2);
+            } else {
+                total += nx * ny * nz;
+            }
+        }
+    }
+    return Math.max(1, total);
 }
 
 module.exports = MCControlPlugin;

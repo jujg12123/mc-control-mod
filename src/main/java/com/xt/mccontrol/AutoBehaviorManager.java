@@ -5,7 +5,13 @@ import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.mob.HostileEntity;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.AxeItem;
 import net.minecraft.item.ItemStack;
+import net.minecraft.item.SwordItem;
+import net.minecraft.item.TridentItem;
+import net.minecraft.registry.Registries;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.math.Box;
 import net.minecraft.world.World;
 
@@ -15,61 +21,91 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Tick 级自动行为管理器。
- * <p>
- * 参考 Mindcraft 项目的 Modes 设计，处理 AI 不必关心的生存逻辑：
- * 自卫、防饥饿、防卡、拾取。所有行为按优先级在客户端主线程（tick 回调）中执行。
- * <p>
- * 行为触发时通过 {@link StateCollector#addBehaviorLog(String)} 记录日志。
+ * Tick-level automatic behavior manager (v1.3, Numen-inspired).
+ *
+ * <p>Priority-based reflexes (higher wins; only the highest active one runs):
+ * <pre>MLG(10) &gt; breath(6) &gt; mob-defense(5) &gt; food-regen(4) &gt; hunger(3)
+ *      &gt; unstuck(2) &gt; pickup(1) &gt; idle</pre>
+ *
+ * <p>During a long task (ActionExecutor busy) only life-threatening reflexes run:
+ * MLG, breath, and an emergency escape when health &lt; 10.
+ *
+ * <p>Per-reflex toggles via setReflexEnabled: self_defense, eat, stuck, pickup,
+ * mlg, breath. The master switch (enabled) still gates everything.
  */
 public class AutoBehaviorManager {
     private static volatile boolean enabled = true;
     private static long lastTickTime = 0;
-    private static final long TICK_INTERVAL_MS = 500; // 每 500ms 检查一次
+    private static final long TICK_INTERVAL_MS = 500;
 
-    // 防卡检测状态
+    // ---- per-reflex toggles ----
+    private static volatile boolean reflexSelfDefense = true;
+    private static volatile boolean reflexEat = true;
+    private static volatile boolean reflexStuck = true;
+    private static volatile boolean reflexPickup = true;
+    private static volatile boolean reflexMlg = true;
+    private static volatile boolean reflexBreath = true;
+
+    // ---- key-release bookkeeping ----
+    private static long escapeActiveUntil = 0;
+    private static long fleeActiveUntil = 0;
+    private static long attackKeyPressedTime = 0;
+    private static long useKeyPressedTime = 0;
+    private static long mlgUseUntil = 0;         // MLG water release time
+    private static long pickupForwardTime = 0;
+
+    // ---- self-defense ----
+    private static long lastAttackTime = 0;
+    private static final long ATTACK_COOLDOWN_MS = 1000;
+    // Numen thresholds: flee when health <= 8 or unarmed
+    private static final float FLEE_HEALTH = 8.0f;
+
+    // ---- eating ----
+    private static long lastEatTime = 0;
+    private static final long EAT_COOLDOWN_MS = 5000;
+    private static final float REGEN_HEALTH = 12.0f;   // eat for regen when hurt
+    private static final int REGEN_FOOD_LEVEL = 18;    // regen needs food >= 18
+    private static final int HUNGRY_LEVEL = 6;         // cannot sprint below 7
+
+    // ---- stuck detection (windowed) + wander burst ----
     private static double lastX = 0, lastY = 0, lastZ = 0;
     private static long lastMoveTime = 0;
-    private static volatile boolean isNavigating = false; // 已废弃：导航状态改由 ActionExecutor.actionInProgress 管理（保留字段仅供 setNavigating 兼容）
     private static long lastJumpTime = 0;
     private static int jumpCount = 0;
     private static long jumpResetTime = 0;
+    private static long lastWanderTime = 0;
+    private static final long WANDER_COOLDOWN_MS = 15000;
+    private static final long WANDER_DURATION_MS = 2000;
+    private static long wanderActiveUntil = 0;
+    private static double wanderStartX = 0, wanderStartZ = 0;
+    private static float wanderYaw = 0;
+    private static int wanderHopPhase = 0;
 
-    // 自卫状态
-    private static long lastAttackTime = 0;
-    private static final long ATTACK_COOLDOWN_MS = 1000;
-    private static long attackKeyPressedTime = 0; // 攻击键按下时间，用于延迟释放
+    // ---- MLG ----
+    private static long mlgActiveUntil = 0;      // per-fall retrigger guard
+    private static final float MLG_FALL_TRIGGER = 4.0f;
 
-    // 进食状态
-    private static long lastEatTime = 0;
-    private static final long EAT_COOLDOWN_MS = 5000;
-    private static long useKeyPressedTime = 0; // 使用键按下时间，用于延迟释放
+    // ---- breath ----
+    private static final int LOW_AIR_TICKS = 240;
+    private static boolean breathActive = false;
 
-    // 逃生状态（任务中保命逃跑的按键自动释放）
-    private static long escapeActiveUntil = 0;
-    private static long fleeActiveUntil = 0; // 普通模式下自动逃离的按键释放时间
-
-    // 拾取状态
+    // ---- pickup ----
     private static long lastPickupAttempt = 0;
     private static final long PICKUP_COOLDOWN_MS = 2000;
-    private static long pickupForwardTime = 0; // 前进键按下时间，用于延迟释放
 
-    // 用于延迟释放按键的调度器（与 ActionExecutor 保持一致的回调模式）
     private static final ScheduledExecutorService scheduler =
             Executors.newSingleThreadScheduledExecutor();
 
     private AutoBehaviorManager() {
     }
 
-    /**
-     * 由客户端 tick 回调驱动。每 {@link #TICK_INTERVAL_MS} 毫秒执行一次各行为检查。
-     */
+    /** Called from the client tick. Runs at most once per TICK_INTERVAL_MS. */
     public static void tick(MinecraftClient client) {
         if (!enabled || client.player == null || client.world == null) return;
 
         long now = System.currentTimeMillis();
 
-        // 统一检查需要释放的按键（在节流之前，确保及时释放）
+        // ---- unified stale-key release (before throttling) ----
         if (escapeActiveUntil > 0 && now > escapeActiveUntil) {
             client.options.forwardKey.setPressed(false);
             client.options.jumpKey.setPressed(false);
@@ -87,6 +123,10 @@ public class AutoBehaviorManager {
             client.options.useKey.setPressed(false);
             useKeyPressedTime = 0;
         }
+        if (mlgUseUntil > 0 && now > mlgUseUntil) {
+            client.options.useKey.setPressed(false);
+            mlgUseUntil = 0;
+        }
         if (pickupForwardTime > 0 && now - pickupForwardTime > 500) {
             client.options.forwardKey.setPressed(false);
             pickupForwardTime = 0;
@@ -98,26 +138,158 @@ public class AutoBehaviorManager {
         ClientPlayerEntity player = client.player;
         World world = client.world;
 
-        // === 修复 #3：长任务进行中时自动行为让位，避免与 AI 动作抢按键 ===
-        // 仅在生命危险（<10）时允许保命逃跑，其它行为一律暂停。
-        if (ActionExecutor.isActionInProgress()) {
-            if (player.getHealth() < 10.0f) {
+        boolean inAction = ActionExecutor.isActionInProgress();
+
+        // ---- life-threatening reflexes run regardless of long tasks ----
+        if (reflexMlg && checkMlg(client, player, now)) return;
+        if (reflexBreath && checkBreath(client, player)) return;
+
+        if (inAction) {
+            // during a long task: only an emergency escape (no key stealing)
+            if (reflexSelfDefense && player.getHealth() < 10.0f) {
                 checkSelfDefenseEscape(client, player, world, now);
             }
             return;
         }
 
-        // 按优先级执行行为
-        checkSelfDefense(client, player, world, now); // 最高优先级：保命
-        checkHunger(client, player, now);             // 高优先级：维持生存
-        checkStuck(client, player, now);              // 中优先级：防止卡住
-        checkPickup(client, player, world, now);      // 低优先级：拾取物品
+        // ---- outside long tasks: full priority chain ----
+        if (reflexSelfDefense && checkSelfDefense(client, player, world, now)) return;
+        if (reflexEat && checkHunger(client, player, now)) return;
+        if (reflexStuck && checkStuck(client, player, now)) return;
+        if (reflexPickup && checkPickup(client, player, world, now)) return;
     }
 
+    // ======================== MLG: water-bucket fall save (priority 10) ========================
+
     /**
-     * 长任务进行中、生命危险时的保命逃跑（不攻击，避免抢 attackKey）。
-     * 仅按 forwardKey 朝远离敌对实体的方向移动。
+     * If falling past 4 blocks with a water bucket available, place water below.
+     * Once per fall (guarded by mlgActiveUntil).
      */
+    private static boolean checkMlg(MinecraftClient client, ClientPlayerEntity player, long now) {
+        if (player.isOnGround()) {
+            mlgActiveUntil = 0;
+            return false;
+        }
+        if (now < mlgActiveUntil) return false;              // already handled this fall
+        if (player.fallDistance < MLG_FALL_TRIGGER) return false;
+
+        int slot = findItemSlot(player, "water_bucket");
+        if (slot < 0) {
+            // remember the fall so we do not spam-scan every tick
+            mlgActiveUntil = now + 1500;
+            return false;
+        }
+        PlayerInventory inv = player.getInventory();
+        if (slot < 9) {
+            inv.selectedSlot = slot;
+        } else {
+            client.interactionManager.pickFromInventory(slot);
+        }
+        player.setPitch(90f);                                // look straight down
+        client.options.useKey.setPressed(true);
+        mlgUseUntil = now + 400;                             // short click
+        mlgActiveUntil = now + 3000;                         // no retrigger this fall
+        StateCollector.addBehaviorLog("MLG: falling " + String.format("%.1f", player.fallDistance)
+                + " blocks, placing water bucket");
+        return true;
+    }
+
+    // ======================== Breath: surface before drowning (priority 6) ========================
+
+    /**
+     * Head underwater with air below 240 ticks: swim up (jump in water ascends)
+     * until air refills. Releases keys when no longer submerged.
+     */
+    private static boolean checkBreath(MinecraftClient client, ClientPlayerEntity player) {
+        if (!player.isSubmergedInWater()) {
+            if (breathActive) {
+                client.options.jumpKey.setPressed(false);
+                client.options.forwardKey.setPressed(false);
+                breathActive = false;
+                StateCollector.addBehaviorLog("breath: surfaced, air refilling");
+            }
+            return false;
+        }
+        if (player.getAir() > LOW_AIR_TICKS) {
+            if (breathActive) {
+                client.options.jumpKey.setPressed(false);
+                client.options.forwardKey.setPressed(false);
+                breathActive = false;
+            }
+            return false;
+        }
+        if (!breathActive) {
+            breathActive = true;
+            StateCollector.addBehaviorLog("breath: air low (" + player.getAir()
+                    + "), swimming up");
+        }
+        client.options.jumpKey.setPressed(true);
+        client.options.forwardKey.setPressed(true);
+        player.setPitch(-80f);
+        return true;
+    }
+
+    // ======================== 1. self defense (priority 5) ========================
+
+    /**
+     * Numen fight-vs-flee: flee when too hurt to trade blows (health <= 8) or
+     * unarmed; otherwise attack hostiles within 4 blocks (1s cooldown).
+     */
+    private static boolean checkSelfDefense(MinecraftClient client, ClientPlayerEntity player,
+                                            World world, long now) {
+        Box searchBox = new Box(player.getX() - 8, player.getY() - 4, player.getZ() - 8,
+                player.getX() + 8, player.getY() + 4, player.getZ() + 8);
+        List<Entity> entities = world.getOtherEntities(player, searchBox,
+                e -> e instanceof HostileEntity && e.isAlive());
+        if (entities.isEmpty()) return false;
+
+        Entity nearest = null;
+        double nearestDist = Double.MAX_VALUE;
+        for (Entity e : entities) {
+            double dist = e.squaredDistanceTo(player);
+            if (dist < nearestDist) {
+                nearestDist = dist;
+                nearest = e;
+            }
+        }
+        if (nearest == null) return false;
+        double dist = Math.sqrt(nearestDist);
+        if (dist >= 8.0) return false;
+
+        boolean armed = hasWeapon(player);
+        if (player.getHealth() <= FLEE_HEALTH || !armed) {
+            // flee away from the threat for 2s
+            double dx = player.getX() - nearest.getX();
+            double dz = player.getZ() - nearest.getZ();
+            float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+            player.setYaw(yaw);
+            client.options.forwardKey.setPressed(true);
+            client.options.jumpKey.setPressed(true);
+            fleeActiveUntil = now + 2000;
+            StateCollector.addBehaviorLog("auto flee from " + nearest.getName().getString()
+                    + (armed ? " (low health)" : " (unarmed)"));
+            return true;
+        }
+
+        if (dist < 4.0 && now - lastAttackTime > ATTACK_COOLDOWN_MS) {
+            double dx = nearest.getX() - player.getX();
+            double dy = (nearest.getY() + nearest.getHeight() / 2)
+                    - (player.getY() + player.getEyeHeight(player.getPose()));
+            double dz = nearest.getZ() - player.getZ();
+            float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+            float pitch = (float) Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+            player.setYaw(yaw);
+            player.setPitch(pitch);
+            client.options.attackKey.setPressed(true);
+            attackKeyPressedTime = now;
+            lastAttackTime = now;
+            StateCollector.addBehaviorLog("auto attack " + nearest.getName().getString());
+            return true;
+        }
+        return false;
+    }
+
+    /** Escape during a long task: run away (no attack key) when health is critical. */
     private static void checkSelfDefenseEscape(MinecraftClient client, ClientPlayerEntity player,
                                                World world, long now) {
         Box searchBox = new Box(player.getX() - 8, player.getY() - 4, player.getZ() - 8,
@@ -135,10 +307,8 @@ public class AutoBehaviorManager {
                 nearest = e;
             }
         }
-        if (nearest == null) return;
-        if (Math.sqrt(nearestDist) >= 8.0) return;
+        if (nearest == null || Math.sqrt(nearestDist) >= 8.0) return;
 
-        // 朝远离实体的方向跑（3 秒后自动释放按键，避免威胁消失后按键泄漏）
         double dx = player.getX() - nearest.getX();
         double dz = player.getZ() - nearest.getZ();
         float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
@@ -146,208 +316,180 @@ public class AutoBehaviorManager {
         client.options.forwardKey.setPressed(true);
         client.options.jumpKey.setPressed(true);
         escapeActiveUntil = now + 3000;
-        StateCollector.addBehaviorLog("任务中遇险自动逃离 " + nearest.getName().getString());
+        StateCollector.addBehaviorLog("task escape from " + nearest.getName().getString());
     }
 
-    // ======================== 1. 自卫模式 ========================
-
-    /**
-     * 检测玩家 8 格范围内的敌对实体。
-     * - 4 格内：自动转向并攻击（攻击冷却 1 秒）。
-     * - 4~8 格且生命值 < 10：朝反方向逃跑。
-     */
-    private static void checkSelfDefense(MinecraftClient client, ClientPlayerEntity player, World world, long now) {
-        // 长任务期间的门控已在 tick() 入口处理，这里无需再判断 isNavigating
-        Box searchBox = new Box(player.getX() - 8, player.getY() - 4, player.getZ() - 8,
-                player.getX() + 8, player.getY() + 4, player.getZ() + 8);
-        List<Entity> entities = world.getOtherEntities(player, searchBox,
-                e -> e instanceof HostileEntity && e.isAlive());
-
-        if (entities.isEmpty()) return;
-
-        // 找最近的敌对实体
-        Entity nearest = null;
-        double nearestDist = Double.MAX_VALUE;
-        for (Entity e : entities) {
-            double dist = e.squaredDistanceTo(player);
-            if (dist < nearestDist) {
-                nearestDist = dist;
-                nearest = e;
+    /** A melee-capable item in hand/hotbar? (sword, axe, trident) */
+    private static boolean hasWeapon(ClientPlayerEntity player) {
+        PlayerInventory inv = player.getInventory();
+        for (int i = 0; i < 9; i++) {
+            ItemStack stack = inv.getStack(i);
+            if (stack.isEmpty()) continue;
+            net.minecraft.item.Item item = stack.getItem();
+            if (item instanceof SwordItem || item instanceof AxeItem || item instanceof TridentItem) {
+                return true;
             }
         }
-
-        if (nearest == null) return;
-
-        double dist = Math.sqrt(nearestDist);
-
-        if (dist < 4.0 && now - lastAttackTime > ATTACK_COOLDOWN_MS) {
-            // 攻击：转向实体并攻击
-            double dx = nearest.getX() - player.getX();
-            // 用与 ActionExecutor.attackEntity 一致的眼高计算方式（兼容 1.20.1）
-            double dy = (nearest.getY() + nearest.getHeight() / 2)
-                    - (player.getY() + player.getEyeHeight(player.getPose()));
-            double dz = nearest.getZ() - player.getZ();
-            float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
-            float pitch = (float) Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
-            player.setYaw(yaw);
-            player.setPitch(pitch);
-
-            // 按下攻击键，由 tick() 统一在 200ms 后释放
-            client.options.attackKey.setPressed(true);
-            attackKeyPressedTime = now;
-            lastAttackTime = now;
-            StateCollector.addBehaviorLog("自动攻击了 " + nearest.getName().getString());
-        } else if (dist < 8.0 && player.getHealth() < 10.0f) {
-            // 逃跑：朝远离实体的方向移动（2 秒后自动释放按键，避免威胁消失后一直跑）
-            double dx = player.getX() - nearest.getX();
-            double dz = player.getZ() - nearest.getZ();
-            float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
-            player.setYaw(yaw);
-            client.options.forwardKey.setPressed(true);
-            fleeActiveUntil = now + 2000;
-            StateCollector.addBehaviorLog("自动逃离 " + nearest.getName().getString());
-        }
+        return false;
     }
 
-    // ======================== 2. 防饥饿模式 ========================
+    // ======================== 2. eating (priority 4 regen / 3 hunger) ========================
 
     /**
-     * 当生命值 < 15 且饥饿值 < 15 时，在背包中查找食物并进食。
-     * 进食冷却 5 秒。
+     * Eat when hurt + food below regen threshold (priority 4) or genuinely
+     * hungry (priority 3). 5s cooldown.
      */
-    private static void checkHunger(MinecraftClient client, ClientPlayerEntity player, long now) {
-        // 长任务期间已在 tick() 入口让位
-        if (now - lastEatTime < EAT_COOLDOWN_MS) return;
+    private static boolean checkHunger(MinecraftClient client, ClientPlayerEntity player, long now) {
+        if (now - lastEatTime < EAT_COOLDOWN_MS) return false;
 
-        if (player.getHealth() >= 15.0f || player.getHungerManager().getFoodLevel() >= 15) return;
+        float health = player.getHealth();
+        int food = player.getHungerManager().getFoodLevel();
+        boolean regenEat = health <= REGEN_HEALTH && food < REGEN_FOOD_LEVEL;
+        boolean plainHungry = food <= HUNGRY_LEVEL;
+        if (!regenEat && !plainHungry) return false;
 
-        // 在背包中查找食物
-        int foodSlot = -1;
-        for (int i = 0; i < 36; i++) {
-            ItemStack stack = player.getInventory().getStack(i);
-            if (!stack.isEmpty() && stack.getItem().isFood()) {
-                foodSlot = i;
-                break;
-            }
-        }
+        int foodSlot = findFoodSlot(player);
+        if (foodSlot < 0) return false;
 
-        if (foodSlot == -1) return;
-
-        // 切换到该槽位
         if (foodSlot < 9) {
             player.getInventory().selectedSlot = foodSlot;
         } else {
             client.interactionManager.pickFromInventory(foodSlot);
         }
-
-        // 按住 useKey 2 秒吃食物，由 tick() 统一释放
         client.options.useKey.setPressed(true);
         useKeyPressedTime = now;
         lastEatTime = now;
-        StateCollector.addBehaviorLog("自动进食补充体力");
+        StateCollector.addBehaviorLog("auto eat (health=" + String.format("%.0f", health)
+                + ", food=" + food + ")");
+        return true;
     }
 
-    // ======================== 3. 防卡模式 ========================
+    private static int findFoodSlot(ClientPlayerEntity player) {
+        PlayerInventory inv = player.getInventory();
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = inv.getStack(i);
+            if (!stack.isEmpty() && stack.getItem().isFood()) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // ======================== 3. stuck (priority 2) ========================
 
     /**
-     * 当不在寻路中（isNavigating == false）时，检测玩家是否卡住。
-     * 仅当玩家有移动意图（按下方向键）但 3 秒内移动距离 < 0.5 格时，才尝试跳跃脱困。
-     * 跳跃冷却 8 秒，30 秒内最多跳跃 3 次，超过则记录失败日志。
+     * Windowed stuck detection (only while the player is trying to move), then:
+     * up to 3 jump attempts, then a Numen-style wander burst (turn ~137 deg,
+     * walk forward, periodic hops) to break out of geometry.
      */
-    private static void checkStuck(MinecraftClient client, ClientPlayerEntity player, long now) {
-        // 长任务期间已在 tick() 入口让位
-
-        // 首次调用时初始化基准位置
-        if (lastMoveTime == 0) {
-            lastX = player.getX();
-            lastY = player.getY();
-            lastZ = player.getZ();
-            lastMoveTime = now;
-            return;
+    private static boolean checkStuck(MinecraftClient client, ClientPlayerEntity player, long now) {
+        // ---- wander burst in progress ----
+        if (now < wanderActiveUntil) {
+            player.setYaw(wanderYaw);
+            player.setPitch(0);
+            client.options.forwardKey.setPressed(true);
+            wanderHopPhase++;
+            if (wanderHopPhase % 5 == 0) {
+                client.options.jumpKey.setPressed(true);
+                scheduler.schedule(() ->
+                        client.execute(() -> client.options.jumpKey.setPressed(false)),
+                        200, TimeUnit.MILLISECONDS);
+            }
+            double moved = Math.hypot(player.getX() - wanderStartX, player.getZ() - wanderStartZ);
+            if (moved > 1.2 || now > wanderActiveUntil - 100) {
+                // escaped or burst time out
+                client.options.forwardKey.setPressed(false);
+                client.options.jumpKey.setPressed(false);
+                wanderActiveUntil = 0;
+                lastWanderTime = now;
+                resetStuckBaseline(player, now);
+                StateCollector.addBehaviorLog(moved > 1.2
+                        ? "unstuck: wander burst broke free (" + String.format("%.1f", moved) + " blocks)"
+                        : "unstuck: wander burst ended");
+            }
+            return true;
         }
 
-        // 检查移动意图：只有玩家正在尝试移动时才判定为卡住
+        // ---- detection: first call initializes baseline ----
+        if (lastMoveTime == 0) {
+            resetStuckBaseline(player, now);
+            return false;
+        }
         boolean tryingToMove = client.options.forwardKey.isPressed()
                 || client.options.backKey.isPressed()
                 || client.options.leftKey.isPressed()
                 || client.options.rightKey.isPressed();
         if (!tryingToMove) {
-            // 没有移动意图，重置基准位置但不触发跳跃
-            lastX = player.getX();
-            lastY = player.getY();
-            lastZ = player.getZ();
-            lastMoveTime = now;
-            return;
+            resetStuckBaseline(player, now);
+            return false;
         }
-
-        double dx = player.getX() - lastX;
-        double dy = player.getY() - lastY;
-        double dz = player.getZ() - lastZ;
-        double moved = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
+        double moved = Math.sqrt(
+                Math.pow(player.getX() - lastX, 2)
+                        + Math.pow(player.getY() - lastY, 2)
+                        + Math.pow(player.getZ() - lastZ, 2));
         if (moved > 0.5) {
-            // 移动距离足够，重置基准
-            lastX = player.getX();
-            lastY = player.getY();
-            lastZ = player.getZ();
-            lastMoveTime = now;
-            return;
+            resetStuckBaseline(player, now);
+            return false;
+        }
+        if (now - lastMoveTime <= 3000) return false;
+
+        // ---- stuck for 3s while trying to move ----
+        if (jumpResetTime == 0) jumpResetTime = now;
+        if (now - jumpResetTime > 30000) {
+            jumpCount = 0;
+            jumpResetTime = now;
         }
 
-        // 移动距离 < 0.5 格，检查是否已持续 3 秒
-        if (now - lastMoveTime > 3000) {
-            // 30 秒内跳跃次数重置
-            if (jumpResetTime == 0) {
-                jumpResetTime = now;
-            }
-            if (now - jumpResetTime > 30000) {
-                jumpCount = 0;
-                jumpResetTime = now;
-            }
-
-            // 检查冷却时间（8 秒）和跳跃次数上限（3 次）
-            if (now - lastJumpTime > 8000 && jumpCount < 3) {
-                // 尝试跳跃一次脱困
-                client.options.jumpKey.setPressed(true);
-                scheduler.schedule(() ->
-                        client.execute(() -> client.options.jumpKey.setPressed(false)),
-                        300, TimeUnit.MILLISECONDS);
-                lastJumpTime = now;
-                jumpCount++;
-                StateCollector.addBehaviorLog("自动跳跃尝试脱困");
-
-                if (jumpCount >= 3) {
-                    StateCollector.addBehaviorLog("防卡失败，连续跳跃3次仍未脱困");
-                }
-            }
-
-            // 重置计时，避免连续触发
-            lastX = player.getX();
-            lastY = player.getY();
-            lastZ = player.getZ();
-            lastMoveTime = now;
+        if (now - lastJumpTime > 8000 && jumpCount < 3) {
+            client.options.jumpKey.setPressed(true);
+            scheduler.schedule(() ->
+                    client.execute(() -> client.options.jumpKey.setPressed(false)),
+                    300, TimeUnit.MILLISECONDS);
+            lastJumpTime = now;
+            jumpCount++;
+            resetStuckBaseline(player, now);
+            StateCollector.addBehaviorLog("unstuck: jump attempt " + jumpCount + "/3");
+            return true;
         }
+
+        // ---- jumps exhausted: wander burst (cooldown-gated) ----
+        if (now - lastWanderTime > WANDER_COOLDOWN_MS) {
+            wanderYaw = player.getYaw() + 137.0f;
+            wanderActiveUntil = now + WANDER_DURATION_MS;
+            wanderStartX = player.getX();
+            wanderStartZ = player.getZ();
+            wanderHopPhase = 0;
+            jumpCount = 0;   // allow jumps again after the burst
+            jumpResetTime = now;
+            StateCollector.addBehaviorLog("unstuck: 3 jumps failed, wander burst");
+            return true;
+        }
+        resetStuckBaseline(player, now);
+        return false;
     }
 
-    // ======================== 4. 拾取模式 ========================
+    private static void resetStuckBaseline(ClientPlayerEntity player, long now) {
+        lastX = player.getX();
+        lastY = player.getY();
+        lastZ = player.getZ();
+        lastMoveTime = now;
+    }
+
+    // ======================== 4. pickup (priority 1) ========================
 
     /**
-     * 检测玩家 5 格范围内的掉落物（ItemEntity）。
-     * 若存在且距离 > 1.5 格，朝最近掉落物方向短暂移动。
-     * 拾取冷却 2 秒。
+     * Walk toward the nearest item drop within 5 blocks (2s cooldown).
      */
-    private static void checkPickup(MinecraftClient client, ClientPlayerEntity player, World world, long now) {
-        // 长任务期间已在 tick() 入口让位
-        if (now - lastPickupAttempt < PICKUP_COOLDOWN_MS) return;
+    private static boolean checkPickup(MinecraftClient client, ClientPlayerEntity player,
+                                       World world, long now) {
+        if (now - lastPickupAttempt < PICKUP_COOLDOWN_MS) return false;
 
         Box searchBox = new Box(player.getX() - 5, player.getY() - 2, player.getZ() - 5,
                 player.getX() + 5, player.getY() + 2, player.getZ() + 5);
         List<Entity> items = world.getOtherEntities(player, searchBox,
                 e -> e instanceof ItemEntity && e.isAlive());
+        if (items.isEmpty()) return false;
 
-        if (items.isEmpty()) return;
-
-        // 找最近的掉落物
         Entity nearest = null;
         double nearestDist = Double.MAX_VALUE;
         for (Entity e : items) {
@@ -357,26 +499,44 @@ public class AutoBehaviorManager {
                 nearest = e;
             }
         }
+        if (nearest == null || Math.sqrt(nearestDist) < 1.5) return false;
 
-        if (nearest == null) return;
-
-        // 已经非常近（< 1.5 格），物品会被自动吸取，无需主动移动
-        if (Math.sqrt(nearestDist) < 1.5) return;
-
-        // 朝最近的掉落物方向短暂移动
         double dx = nearest.getX() - player.getX();
         double dz = nearest.getZ() - player.getZ();
         float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
         player.setYaw(yaw);
         client.options.forwardKey.setPressed(true);
-        // 500ms 后释放前进键，由 tick() 统一释放
         pickupForwardTime = now;
         lastPickupAttempt = now;
-        StateCollector.addBehaviorLog("自动拾取掉落物");
+        StateCollector.addBehaviorLog("auto pickup item");
+        return true;
     }
 
-    // ======================== 公开接口 ========================
+    // ======================== helpers & public API ========================
 
+    /** Find an inventory slot whose item id/name contains {@code name}. */
+    private static int findItemSlot(ClientPlayerEntity player, String name) {
+        PlayerInventory inv = player.getInventory();
+        String needle = name.toLowerCase();
+        String needleDisplay = needle.replace('_', ' ');
+        for (int pass = 0; pass < 2; pass++) {
+            int from = pass == 0 ? 0 : 9;
+            int to = pass == 0 ? 9 : 36;
+            for (int i = from; i < to; i++) {
+                ItemStack stack = inv.getStack(i);
+                if (stack.isEmpty()) continue;
+                Identifier id = Registries.ITEM.getId(stack.getItem());
+                String idPath = id != null ? id.getPath().toLowerCase() : "";
+                String display = stack.getItem().getName().getString().toLowerCase();
+                if (idPath.contains(needle) || display.contains(needleDisplay)) {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /** Master switch. */
     public static void setEnabled(boolean e) {
         enabled = e;
     }
@@ -385,9 +545,45 @@ public class AutoBehaviorManager {
         return enabled;
     }
 
+    /**
+     * Toggle one reflex or the master switch.
+     * Names: self_defense, eat, stuck, pickup, mlg, breath, all.
+     * @return a human-readable result, or null for an unknown name.
+     */
+    public static String setReflexEnabled(String name, boolean enable) {
+        String label = name;
+        switch (name) {
+            case "":
+            case "all":
+                enabled = enable;
+                label = "all";
+                break;
+            case "self_defense":
+                reflexSelfDefense = enable;
+                break;
+            case "eat":
+                reflexEat = enable;
+                break;
+            case "stuck":
+                reflexStuck = enable;
+                break;
+            case "pickup":
+                reflexPickup = enable;
+                break;
+            case "mlg":
+                reflexMlg = enable;
+                break;
+            case "breath":
+                reflexBreath = enable;
+                break;
+            default:
+                return null;
+        }
+        return "reflex " + label + " " + (enable ? "enabled" : "disabled");
+    }
+
     public static void setNavigating(boolean n) {
-        // 已废弃：导航/动作状态现由 ActionExecutor.actionInProgress 统一管理，
-        // 此处保留空实现仅为兼容旧调用。
+        // deprecated: navigation state is managed by ActionExecutor.actionInProgress
     }
 
     public static boolean isNavigating() {

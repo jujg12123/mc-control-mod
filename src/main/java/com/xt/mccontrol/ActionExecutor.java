@@ -469,11 +469,11 @@ public class ActionExecutor {
         if (!isStandable(world, start)) return null;
 
         // 成本优先队列（Dijkstra）：每次扩展当前最小成本节点
-        PriorityQueue<BlockPos> queue = new PriorityQueue<>(
-                Comparator.comparingInt(p -> costMap.getOrDefault(p, Integer.MAX_VALUE)));
         Map<BlockPos, BlockPos> cameFrom = new HashMap<>();
         Map<BlockPos, Integer> costMap = new HashMap<>();
         Set<BlockPos> visited = new HashSet<>();
+        PriorityQueue<BlockPos> queue = new PriorityQueue<>(
+                Comparator.comparingInt(p -> costMap.getOrDefault(p, Integer.MAX_VALUE)));
         queue.add(start);
         costMap.put(start, 0);
         int maxNodes = 24000;
